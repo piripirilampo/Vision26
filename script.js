@@ -1185,7 +1185,7 @@ function buildCity(r, n) {
 
   // Grid parameters — density controls block size (low density = few large, high density = many small)
   // n ranges 5..35 from the density slider
-  const t = Math.max(0, Math.min(1, (n - 5) / 30));  // 0 = min density, 1 = max density
+  const t = Math.max(0, Math.min(0.8, (n - 5) / 30));  // 0 = min density, capped at 0.8
   const blockUnit = Math.round(200 - t * 155);        // 200px → 45px
   const roadWidth = Math.round(40 - t * 12);          // 40px → 28px
   const cellSize = blockUnit + roadWidth;
