@@ -2260,6 +2260,27 @@ menuToggle.addEventListener('click', () => {
 });
 
 // ================================================================
+// INFO PANEL TOGGLE
+// ================================================================
+const infoToggle = document.getElementById('infoToggle');
+const infoPanel  = document.getElementById('infoPanel');
+
+infoToggle.addEventListener('click', () => {
+  const isOpen = infoToggle.dataset.state === 'open';
+  if (isOpen) {
+    infoPanel.classList.add('info-panel--closed');
+    infoToggle.dataset.state = 'closed';
+    infoToggle.setAttribute('aria-label', 'Open instructions');
+    document.body.classList.remove('info-open');
+  } else {
+    infoPanel.classList.remove('info-panel--closed');
+    infoToggle.dataset.state = 'open';
+    infoToggle.setAttribute('aria-label', 'Close instructions');
+    document.body.classList.add('info-open');
+  }
+});
+
+// ================================================================
 // CUSTOM SELECT DROPDOWNS (Art of Noise style)
 // ================================================================
 function buildSelect(wrapperId, triggerId, menuId, labelId, onChange) {

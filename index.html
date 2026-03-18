@@ -11,6 +11,9 @@
 <!-- Menu toggle -->
 <button class="menu-toggle" id="menuToggle" aria-label="Toggle menu" data-state="open"></button>
 
+<!-- Info toggle -->
+<button class="info-toggle" id="infoToggle" aria-label="Toggle instructions" data-state="closed"></button>
+
 <div class="layout" id="layout">
 
   <!-- ═══════════ PANEL ═══════════ -->
@@ -181,6 +184,71 @@
       <button class="btn" id="clrBtn">Clear</button>
     </div>
   </main>
+
+  <!-- ═══════════ INFO PANEL ═══════════ -->
+  <aside class="info-panel info-panel--closed" id="infoPanel" aria-label="Instructions panel">
+  <div class="panel__scroll">
+
+    <div class="brand-block">
+      <div class="info-panel__title">Instructions</div>
+    </div>
+
+    <section class="info-section">
+      <p>This is a custom VISION26 Pattern Generator, a generative design tool developed for the Motive Vision identity. It creates animated, interactive pattern compositions in real time, which can be exported as digital assets for use across project applications.</p>
+    </section>
+
+    <section class="info-section">
+      <h3>Patterns</h3>
+      <p>Choose from four pattern types, each representing a part of Motive:</p>
+      <ul>
+        <li><strong>Pathways</strong> — Flowing lines that reflect Motive's logistics moving across roads.</li>
+        <li><strong>Terrain</strong> — Layered lines inspired by agriculture and natural landscapes.</li>
+        <li><strong>City</strong> — A grid of streets and blocks representing urban logistics.</li>
+        <li><strong>Networks</strong> — Connected points showing technology and innovation.</li>
+      </ul>
+    </section>
+
+    <section class="info-section">
+      <h3>Themes</h3>
+      <p>Switch between Light, Dark, and two Color modes. Use Invert to flip the colors.</p>
+    </section>
+
+    <section class="info-section">
+      <h3>Motion</h3>
+      <ul>
+        <li><strong>Interactive</strong> — Place rectangles on the canvas to create open areas in the pattern for content or images to be placed after exporting.</li>
+        <li><strong>Passive</strong> — The pattern animates on its own.</li>
+        <li><strong>Animate Lines</strong> — Turn line movement on or off.</li>
+        <li><strong>Fixed / Spatial</strong> — Keep the pattern still or add a slow drifting motion.</li>
+      </ul>
+    </section>
+
+    <section class="info-section">
+      <h3>Controls</h3>
+      <ul>
+        <li><strong>Speed</strong> — Adjust how fast the pattern moves.</li>
+        <li><strong>Density</strong> — Control how full or minimal the pattern feels.</li>
+        <li><strong>Seed</strong> — Generate a new version of the pattern.</li>
+        <li><strong>Reset</strong> — Return everything to default.</li>
+      </ul>
+    </section>
+
+    <section class="info-section">
+      <h3>Rectangles (Interactive mode)</h3>
+      <p>Click + Rectangle, then drag on the canvas to place one. The pattern will adapt around it. Use Clear to remove all rectangles.</p>
+    </section>
+
+    <section class="info-section">
+      <h3>Export</h3>
+      <ul>
+        <li><strong>PNG / JPG</strong> — Save a still image.</li>
+        <li><strong>SVG</strong> — Export a scalable file.</li>
+        <li><strong>Animation</strong> — Record a 10-second loop.</li>
+      </ul>
+    </section>
+
+  </div>
+  </aside>
 
 </div>
 
