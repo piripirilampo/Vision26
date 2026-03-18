@@ -63,52 +63,25 @@ body {
   width: 100vw;
   height: 100vh;
   z-index: 0;
-  cursor: crosshair;
+  cursor: default;
 }
-.stage.active-mode #pattern-canvas { cursor: none; }
 
-#cursor-ring {
-  position: fixed;
-  pointer-events: none;
-  border-radius: 50%;
-  border: 1px solid var(--line-color);
-  opacity: 0;
-  transform: translate(-50%, -50%);
-  transition: opacity 0.18s;
-  width: 56px; height: 56px;
-}
-.stage.active-mode #cursor-ring { opacity: 0.35; }
+#cursor-ring { display: none; }
 
 /* Shape toolbar */
 #shape-toolbar {
   position: absolute;
   bottom: 20px; left: 50%;
   transform: translateX(-50%);
-  display: flex;
-  border: var(--btn-stroke) solid var(--ink);
-  border-radius: var(--radius-pill);
-  background: rgba(0,0,0,0.85);
-  backdrop-filter: blur(10px);
-  overflow: hidden;
+  display: flex; gap: 7px;
   opacity: 0; pointer-events: none;
   transition: opacity 0.22s;
 }
 #shape-toolbar.visible { opacity: 1; pointer-events: all; }
-.shape-btn {
-  height: 36px; padding: 0 14px;
-  border: none;
-  border-right: var(--btn-stroke) solid var(--line);
-  background: transparent;
-  color: var(--ink-dim);
-  font-size: 14px; cursor: pointer;
-  transition: background 0.15s, color 0.15s;
-  display: flex; align-items: center; justify-content: center;
-  white-space: nowrap;
-  font-family: Helvetica, Arial, sans-serif;
+#shape-toolbar .btn {
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
 }
-.shape-btn:last-child { border-right: none; }
-.shape-btn:hover { background: rgba(255,255,255,0.1); color: var(--ink); }
-.shape-btn.is-active { background: #fff; color: #000; }
 
 /* ===== Menu toggle button ===== */
 .menu-toggle {

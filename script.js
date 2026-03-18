@@ -8,7 +8,7 @@ const S = {
   movement: 'fixed', spatialX: 0,
   speed: 0.5, density: 0.5, seed: 5,
   lineColor: '#FFFFFF', canvasBg: '#DFDFDF',
-  shapes: [], selectedShape: 'circle',
+  shapes: [],
   mx: -9999, my: -9999, recording: false,
   networkNodes: null
 };
@@ -898,18 +898,9 @@ function buildTerrain(r, n) {
     const chains = GEO.chainSegments(segs);
 
     for (const chain of chains) {
-      // Filter to avoid tiny isolated loops (design constraint)
-      // Only include chains with substantial length
       if (chain.length >= 8) {
         const pts = GEO.smoothCatmullRom(chain, 0.5);
-
-        // Optional: light post-smoothing to enhance contour clarity while preserving structure
-        // Skip secondary smoothing by default to preserve topographic character
-        paths.push({
-          pts,
-          off: r() * UNIT * 4,
-          sp: 0.15 + r() * 0.25  // Slightly faster animation for more visible hierarchy
-        });
+        paths.push({ pts, off: r() * UNIT * 4, sp: 0.15 + r() * 0.25 });
       }
     }
   }
@@ -936,7 +927,7 @@ function buildPathways(r, n) {
 
   const linesPerBundle = Math.max(6, Math.floor(6 + n * 0.27));  // 6–15 lines
   const lineSpacing    = 20;    // px gap between consecutive lines in a bundle
-  const baseRadius     = 80;    // corner-arc radius for the trunk center line
+  const baseRadius     = 160;   // corner-arc radius for the trunk center line (large for smooth rounded turns)
   const bleed          = 200;   // extend well beyond canvas edges (covers spatial drift)
   const ARC_STEPS      = 24;    // arc sample resolution
 
@@ -1072,57 +1063,92 @@ function buildPathways(r, n) {
     return pts;
   }
 
-  // ── Generate four non-crossing L-shaped corridors — independently seeded ──
+  // ── Seed → 5-trunk directional composition ──────────────────────────────
   //
-  // Corridor layout:
-  //   C1  top → right   (vertical entry, horizontal exit right)
-  //   C3  top → left    (vertical entry, horizontal exit left)
-  //   C2  left → bottom (horizontal entry, vertical exit bottom)
-  //   C4  right → bottom(horizontal entry, vertical exit bottom)
+  // Every seed produces exactly 5 L-shaped bundles, each entering from a
+  // different edge.  All 11 seeds share the same density, line count and
+  // spacing — they differ only in which directions the paths travel.
   //
-  // Non-crossing invariants (guaranteed by construction):
-  //   bx1 > bx3   (C1 right of C3 at top)
-  //   bx4 > bx2   (C4 right of C2 at bottom)
-  //   by1, by3 < H*0.50   (top pair bends in upper half)
-  //   by2, by4 > H*0.50   (bottom pair bends in lower half)
+  // Layouts are derived from two verified base arrangements (A, B) via
+  // horizontal / vertical mirror transforms, plus two hand-crafted combos.
+  // Mirror transforms preserve the non-crossing property by construction.
   //
-  // Gap between same-pair bundles: minBundleDist (touching) to ~40% canvas (open)
-  // All four bend heights are independent → unique layouts per seed.
+  // Non-crossing invariants:
+  //   • Each trunk occupies a unique grid column AND row (spacing = step).
+  //   • Templates open toward different corners of the canvas.
+  //   • Edge-to-edge gap between bundles = lineSpacing (matches intra-bundle).
+  //   • Higher density → wider bundles → larger step → bundles push apart.
 
-  const bundleHalfW   = (linesPerBundle - 1) / 2 * lineSpacing;
-  const minBundleDist = 2 * bundleHalfW + lineSpacing;  // center-to-center when touching
+  const bundleW = (linesPerBundle - 1) * lineSpacing;
+  const step    = bundleW + lineSpacing;
+  const halfW   = W * 0.5, halfH = H * 0.5;
 
-  // ── Top pair: C1 (right) and C3 (left) ──────────────────────────────────
-  const topMidX = W * (0.30 + rng() * 0.40);              // shared midpoint: 30–70%
-  const topHalf = minBundleDist / 2 + rng() * W * 0.06;   // touching → ~6% W apart
-  const bx1 = topMidX + topHalf;
-  const bx3 = topMidX - topHalf;
+  // ── 8 L-shaped template directions ────────────────────────────────────────
+  const T = [
+    (bx,by)=>[{x:bx,     y:-bleed}, {x:bx,y:by},{x:W+bleed,y:by}],       // 0 top→right
+    (bx,by)=>[{x:-bleed, y:by},     {x:bx,y:by},{x:bx,     y:H+bleed}],  // 1 left→bottom
+    (bx,by)=>[{x:bx,     y:-bleed}, {x:bx,y:by},{x:-bleed, y:by}],       // 2 top→left
+    (bx,by)=>[{x:W+bleed,y:by},     {x:bx,y:by},{x:bx,     y:H+bleed}],  // 3 right→bottom
+    (bx,by)=>[{x:bx,     y:H+bleed},{x:bx,y:by},{x:W+bleed,y:by}],       // 4 bottom→right
+    (bx,by)=>[{x:-bleed, y:by},     {x:bx,y:by},{x:bx,     y:-bleed}],   // 5 left→top
+    (bx,by)=>[{x:bx,     y:H+bleed},{x:bx,y:by},{x:-bleed, y:by}],       // 6 bottom→left
+    (bx,by)=>[{x:W+bleed,y:by},     {x:bx,y:by},{x:bx,     y:-bleed}],   // 7 right→top
+  ];
 
-  // ── Bottom pair: C2 (left) and C4 (right) ───────────────────────────────
-  const botMidX = W * (0.30 + rng() * 0.40);              // independent midpoint: 30–70%
-  const botHalf = minBundleDist / 2 + rng() * W * 0.06;
-  const bx2 = botMidX - botHalf;
-  const bx4 = botMidX + botHalf;
+  // ── 11 non-crossing 5-trunk layouts (one per seed) ────────────────────────
+  //
+  // Each layout places 5 L-shaped trunks on unique grid (col, row) positions.
+  // Templates (t) determine which two edges the L connects.
+  // Designed for maximum visual variety — NOT simple mirrors of each other.
+  //
+  //  seed  character           dominant flow
+  //  ────  ──────────────────  ──────────────────────────────
+  //   0    diagonal sweep NW   top-left corners, paths fan SE
+  //   1    horizontal cross    left/right dominant, vertical center
+  //   2    vertical cascade    top/bottom dominant, horizontal center
+  //   3    pinwheel CW         each path rotates clockwise around center
+  //   4    scattered radial    paths radiate outward from different zones
+  //   5    balanced cross  ★   left↔top / right↔bottom cross pattern
+  //   6    asymmetric cluster  tight upper group + wide lower spread
+  //   7    diagonal sweep SE   bottom-right corners, paths fan NW
+  //   8    staggered columns   vertical paths offset like brickwork
+  //   9    converging arrows   paths aim toward center from edges
+  //  10    wide frame          paths trace the outer perimeter zone
 
-  // ── Vertical bend positions — push-apart enforced ────────────────────────
-  // C1 (by1) and C4 (by4) share the right side; C3 (by3) and C2 (by2) share the left.
-  // Their horizontal bundles need vertical gap ≥ minBundleDist to avoid overlap.
-  const by1raw = H * (0.18 + rng() * 0.26);   // C1 raw bend: 18–44%
-  const by3raw = H * (0.18 + rng() * 0.26);   // C3 raw bend: 18–44%
-  const by4raw = H * (0.56 + rng() * 0.26);   // C4 raw bend: 56–82%
-  const by2raw = H * (0.56 + rng() * 0.26);   // C2 raw bend: 56–82%
+  const LAYOUTS = [
+    // 0  — diagonal NW sweep: paths fan from top-left quadrant
+    [{t:0,c:-2,r:-2},{t:2,c:-1,r:-1},{t:5,c: 1,r: 0},{t:1,c: 0,r: 1},{t:4,c: 2,r: 2}],
+    // 1  — horizontal cross: left/right entries with vertical bridge
+    [{t:1,c:-2,r:-1},{t:7,c: 2,r:-2},{t:0,c: 0,r: 0},{t:3,c: 2,r: 1},{t:6,c:-1,r: 2}],
+    // 2  — vertical cascade: top/bottom dominant flow
+    [{t:0,c:-1,r:-2},{t:4,c: 1,r: 2},{t:2,c: 0,r: 0},{t:3,c: 2,r:-1},{t:5,c:-2,r: 1}],
+    // 3  — pinwheel CW: each path rotates around center
+    [{t:0,c: 1,r:-2},{t:3,c: 2,r: 1},{t:4,c:-1,r: 2},{t:5,c:-2,r:-1},{t:7,c: 0,r: 0}],
+    // 4  — scattered radial: paths from different zones
+    [{t:2,c:-2,r:-2},{t:7,c: 2,r:-1},{t:1,c:-1,r: 1},{t:4,c: 1,r: 2},{t:0,c: 0,r: 0}],
+    // 5  — base B  ★ user's favourite
+    [{t:5,c:-1,r:-2},{t:3,c: 1,r: 2},{t:7,c: 2,r:-1},{t:6,c:-2,r: 1},{t:1,c:0,r:0}],
+    // 6  — asymmetric cluster: tight top + wide bottom spread
+    [{t:5,c: 0,r:-2},{t:2,c:-1,r:-1},{t:7,c: 2,r: 0},{t:6,c:-2,r: 1},{t:4,c: 1,r: 2}],
+    // 7  — diagonal SE sweep: paths fan from bottom-right quadrant
+    [{t:4,c: 2,r: 2},{t:6,c: 1,r: 1},{t:7,c:-1,r: 0},{t:3,c: 0,r:-1},{t:0,c:-2,r:-2}],
+    // 8  — staggered columns: vertical paths offset like bricks
+    [{t:0,c:-2,r:-1},{t:4,c:-1,r: 2},{t:2,c: 0,r:-2},{t:0,c: 1,r: 1},{t:6,c: 2,r: 0}],
+    // 9  — converging arrows: paths aim toward center from edges
+    [{t:0,c:-1,r:-2},{t:1,c:-2,r: 1},{t:7,c: 2,r:-1},{t:4,c: 1,r: 2},{t:3,c: 0,r: 0}],
+    // 10 — wide frame: paths trace the outer perimeter zone
+    [{t:0,c:-2,r:-2},{t:3,c: 2,r:-1},{t:4,c: 2,r: 2},{t:6,c:-2,r: 2},{t:5,c:-1,r: 0}],
+  ];
 
-  const by1 = by1raw;
-  const by4 = Math.max(by4raw, by1 + minBundleDist);  // push C4 down if needed
-  const by3 = by3raw;
-  const by2 = Math.max(by2raw, by3 + minBundleDist);  // push C2 down if needed
+  // ── Build trunks from selected layout ─────────────────────────────────────
+  const layout = LAYOUTS[Math.min(S.seed, 10)];
 
-  const trunk1 = [{ x: bx1, y: -bleed },    { x: bx1, y: by1 }, { x: W + bleed, y: by1 }];
-  const trunk2 = [{ x: -bleed, y: by2 },    { x: bx2, y: by2 }, { x: bx2, y: H + bleed }];
-  const trunk3 = [{ x: bx3, y: -bleed },    { x: bx3, y: by3 }, { x: -bleed,    y: by3 }];
-  const trunk4 = [{ x: W + bleed, y: by4 }, { x: bx4, y: by4 }, { x: bx4, y: H + bleed }];
+  for (let ti = 0; ti < layout.length; ti++) {
+    const L  = layout[ti];
+    const bx = halfW + L.c * step + (rng() - 0.5) * step * 0.06;
+    const by = halfH + L.r * step + (rng() - 0.5) * step * 0.06;
+    const trunk = T[L.t](bx, by);
 
-  for (const trunk of [trunk1, trunk2, trunk3, trunk4]) {
     for (let li = 0; li < linesPerBundle; li++) {
       const lineOffset = (li - (linesPerBundle - 1) / 2) * lineSpacing;
       const pts = traceOffsetLine(trunk, lineOffset);
@@ -1174,21 +1200,42 @@ function buildCity(r, n) {
   // Each corridor has a width and two parallel edges.
   // Blocks are clipped so only parts OUTSIDE the corridor are drawn.
   // The corridor itself is empty space — an open avenue.
-  const numDiag = Math.floor(rng() * 3.5);   // 0, 1, 2, or 3 avenues
+  // Diagonal count: seed 0 → 0 diagonals, seed 10 → 4 diagonals max.
+  // The 11 seeds round-map onto 0–4 so repeated counts produce compositional
+  // variations (diagRng is seeded by S.seed, so same count ≠ same layout).
+  //   seeds 0,1 → 0  |  seeds 2,3 → 1  |  seeds 4,5,6 → 2
+  //   seeds 7,8 → 3  |  seeds 9,10 → 4
+  const numDiag = Math.round(S.seed / 10 * 4);
   const corridors = [];
+  const diagRng = mkRand(S.seed * 31337 + 99991);
+
+  // Four angle zones — each assigned a distinct compass direction so no two
+  // corridors can ever be parallel.  Zones cycle: shallow-NE → shallow-NW →
+  // steep-NE → steep-NW.  Minimum angular separation between any pair is ~16°
+  // even at maximum random variation (±6.9° per zone).
+  //   Zone 0: +45°   shallow NE
+  //   Zone 1: -45°   shallow NW  (90° from zone 0 as undirected lines)
+  //   Zone 2: +75°   steep   NE  (30° from zone 0)
+  //   Zone 3: -75°   steep   NW  (30° from zone 1, 90° from zone 2)
+  const ZONE_ANGLES = [
+     Math.PI * 0.250,   // +45°
+    -Math.PI * 0.250,   // -45°
+     Math.PI * 0.417,   // +75°
+    -Math.PI * 0.417,   // -75°
+  ];
+  const ZONE_VAR = 0.12;  // ±6.9° variation within each zone
 
   for (let p = 0; p < numDiag; p++) {
-    const dir = rng() > 0.5 ? 1 : -1;
-    const angle = dir * (Math.PI / 4 + (rng() - 0.5) * 0.45);  // ±~26° variation around 45°
-    const sinA = Math.sin(angle);
-    const cosA = Math.cos(angle);
-    const perpOff = (rng() - 0.5) * Math.min(W, H) * 0.55;
-    const halfW = roadWidth * 1.2;   // Avenue width = slightly wider than a regular road
+    const angle   = ZONE_ANGLES[p % ZONE_ANGLES.length] + (diagRng() - 0.5) * ZONE_VAR;
+    const sinA    = Math.sin(angle);
+    const cosA    = Math.cos(angle);
+    const perpOff = (diagRng() - 0.5) * Math.min(W, H) * 0.55;
+    const halfW   = roadWidth * 1.2;
 
     corridors.push({
       cx: W / 2 - perpOff * sinA,
       cy: H / 2 + perpOff * cosA,
-      px: -sinA, py: cosA,   // Perpendicular unit vector (across road)
+      px: -sinA, py: cosA,
       halfW
     });
   }
@@ -1260,12 +1307,26 @@ function buildCity(r, n) {
         for (let dr = 0; dr < bh; dr++)
           occupied.add(`${col + dc},${row + dr}`);
 
-      // Clip block rect against all diagonal corridors (keep parts outside corridors)
+      // Clip block rect against diagonal corridors AND shape rectangles
       const rectPts = [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }];
-      const clippedPolys = clipByCorridors(rectPts);
+      const corridorClipped = clipByCorridors(rectPts);
 
-      // Render each surviving polygon fragment
-      for (const poly of clippedPolys) {
+      // Always store corridor-clipped polygons as blockPoly on each path.
+      // Shape-rect clipping is deferred to draw-time so it works smoothly
+      // whether added in fixed or spatial mode (no discrete rebuild jumps).
+      for (const poly of corridorClipped) {
+        // Skip fragments that are too thin in either dimension
+        const MIN_BLOCK = roadWidth * 0.8;
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+        for (const p of poly) {
+          if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+          if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+        }
+        if (maxX - minX < MIN_BLOCK || maxY - minY < MIN_BLOCK) continue;
+
+        // Store polygon corners as structural vertices for rigid repulsion
+        const verts = poly.map(p => ({ x: p.x, y: p.y }));
+
         const ring = [...poly, poly[0]];
         const pts = [];
         for (let i = 0; i < ring.length - 1; i++) {
@@ -1280,13 +1341,16 @@ function buildCity(r, n) {
         pts.push(pts[0]);
 
         if (pts.length > 4) {
-          paths.push({ pts, off: rng() * UNIT * 2, sp: 0.15 + rng() * 0.2 });
+          paths.push({ pts, off: rng() * UNIT * 2, sp: 0.15 + rng() * 0.2, rigid: true, verts,
+                        blockPoly: poly.map(p => ({ x: p.x, y: p.y })),
+                        blockRoadW: roadWidth });
         }
       }
 
       row += bh;
     }
   }
+
 }
 
 /**
@@ -1295,14 +1359,22 @@ function buildCity(r, n) {
  * Reference: uniform triangulated mesh filling edge-to-edge
  */
 function buildNetworks(r, n) {
-  // Node count: ~40-60 nodes at 50% density to match reference density
-  const nc = Math.max(12, Math.floor(n * 2.2));
+  // Node count: min density denser than before, max density has real weight
+  // n ranges 5..35 → nc ranges ~24..62
+  const nc = Math.max(20, Math.floor(18 + n * 1.25));
   const nodes = [];
 
   // Bleed beyond canvas edges so triangulation mesh extends off all sides
   const bleed = 200;
   const areaW = W + bleed * 2;
   const areaH = H + bleed * 2;
+
+  // Convert screen-space shapes to world-space for node/edge rejection
+  const curDrift = S.movement === 'spatial' ? Math.sin(S.spatialX) * 120 : 0;
+  const savedShapes = S.shapes;
+  if (curDrift !== 0) {
+    S.shapes = S.shapes.map(sh => ({ x: sh.x - curDrift, y: sh.y, w: sh.w, h: sh.h }));
+  }
 
   // Poisson-disk scatter filling canvas + bleed area
   const minDist = Math.sqrt((areaW * areaH) / nc) * 0.55;
@@ -1314,6 +1386,8 @@ function buildNetworks(r, n) {
     for (const node of nodes) {
       if (Math.hypot(x - node.x, y - node.y) < minDist) { tooClose = true; break; }
     }
+    // Reject nodes inside (or too close to) shape rectangles
+    if (!tooClose && S.shapes.length > 0 && ptInAnyShape(x, y, 18)) { attempts++; continue; }
     if (!tooClose) nodes.push({ x, y });
     attempts++;
   }
@@ -1322,7 +1396,10 @@ function buildNetworks(r, n) {
   const delaunayEdges = GEO.delaunayTriangulate(nodes);
 
   for (const [p0, p1] of delaunayEdges) {
-    // Interpolate edge into points for dashed animation
+    // Skip edges that pass through a shape rectangle
+    if (S.shapes.length > 0 && segCrossesAnyShape(p0, p1)) continue;
+    // Store structural endpoints — interpolation happens at draw time
+    // so repulsion can move endpoints and re-interpolate a straight line
     const dx = p1.x - p0.x, dy = p1.y - p0.y;
     const steps = Math.ceil(Math.hypot(dx, dy) / 6);
     const pts = [];
@@ -1330,7 +1407,39 @@ function buildNetworks(r, n) {
       const t = i / steps;
       pts.push({ x: p0.x + dx * t, y: p0.y + dy * t });
     }
-    paths.push({ pts, off: r() * UNIT * 2, sp: 0.5 + r() * 0.8 });
+    paths.push({ pts, off: r() * UNIT * 2, sp: 0.5 + r() * 0.8, rigid: true,
+                  verts: [{ x: p0.x, y: p0.y }, { x: p1.x, y: p1.y }] });
+  }
+
+  // Restore original screen-space shapes
+  S.shapes = savedShapes;
+
+  // ── Rectangle integration: perimeter edges + dynamic corner connections ──
+  for (const sh of S.shapes) {
+    const corners = [
+      { x: sh.x, y: sh.y },
+      { x: sh.x + sh.w, y: sh.y },
+      { x: sh.x + sh.w, y: sh.y + sh.h },
+      { x: sh.x, y: sh.y + sh.h },
+    ];
+
+    // 4 perimeter edges connecting the corners
+    for (let ci = 0; ci < 4; ci++) {
+      const a = corners[ci], b = corners[(ci + 1) % 4];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const steps = Math.ceil(Math.hypot(dx, dy) / 6);
+      const pts = [];
+      for (let j = 0; j <= steps; j++) {
+        const t = j / steps;
+        pts.push({ x: a.x + dx * t, y: a.y + dy * t });
+      }
+      if (pts.length > 2) {
+        paths.push({ pts, off: r() * UNIT * 2, sp: 0.5 + r() * 0.8, rigid: true, screenFixed: true });
+      }
+    }
+
+    // Corner-to-node connections are drawn dynamically at draw time
+    // so they stay connected as the pattern drifts in spatial mode.
   }
 
   S.networkNodes = nodes;
@@ -1343,27 +1452,382 @@ function buildNetworks(r, n) {
 const CR=5, BW=33, BH=Math.round(CR*2*.865), GAP=4, UNIT_GAP=8, UNIT=CR*2+GAP+BW+UNIT_GAP;
 
 /**
- * Repulsion force: cursor and placed shapes push nearby points outward
+ * Sutherland-Hodgman half-plane clip (top-level for reuse in draw loop).
+ * Keeps the side of polygon where signed dist >= threshold.
  */
-function repulse(x, y) {
+function clipPolyHP(pts, cx, cy, nx, ny, threshold) {
+  if (pts.length === 0) return [];
+  const out = [];
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % pts.length];
+    const da = (a.x - cx) * nx + (a.y - cy) * ny - threshold;
+    const db = (b.x - cx) * nx + (b.y - cy) * ny - threshold;
+    if (da >= 0) out.push(a);
+    if ((da > 0 && db < 0) || (da < 0 && db > 0)) {
+      const t = da / (da - db);
+      out.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+    }
+  }
+  return out;
+}
+
+/**
+ * Clip a polygon against a rectangular exclusion zone.
+ * Returns array of polygon fragments OUTSIDE the rectangle.
+ */
+function clipPolyByRect(poly, rx, ry, rw, rh) {
+  const above = clipPolyHP(poly, rx, ry, 0, -1, 0);
+  const below = clipPolyHP(poly, rx, ry + rh, 0, 1, 0);
+  const hMiddle = clipPolyHP(
+    clipPolyHP(poly, rx, ry, 0, 1, 0),
+    rx, ry + rh, 0, -1, 0
+  );
+  const result = [];
+  if (above.length > 2)  result.push(above);
+  if (below.length > 2)  result.push(below);
+  if (hMiddle.length > 2) {
+    const left  = clipPolyHP(hMiddle, rx, ry, -1, 0, 0);
+    const right = clipPolyHP(hMiddle, rx + rw, ry, 1, 0, 0);
+    if (left.length > 2)  result.push(left);
+    if (right.length > 2) result.push(right);
+  }
+  return result;
+}
+
+/**
+ * Repulsion force: cursor and rectangle shapes push nearby points outward.
+ * Both use the same soft-falloff principle — rectangles use SDF (signed
+ * distance field) so points are pushed away from the nearest surface point.
+ */
+function repulse(x, y, drift = 0) {
+  const sx = x + drift;
   let ox = 0, oy = 0;
-  if (S.mode === 'active' && S.mx > 0) {
-    const dx = x - S.mx, dy = y - S.my, d = Math.sqrt(dx*dx + dy*dy), R = 80;
-    if (d < R && d > 0) {
-      const f = (1 - d / R) * 30;
-      ox += (dx / d) * f;
-      oy += (dy / d) * f;
-    }
-  }
+
+  // Rectangle shape repulsion — SDF push from nearest surface point
+  const R_RECT = 150;
+  const F_RECT = 80;
   for (const sh of S.shapes) {
-    const dx = x - sh.x, dy = y - sh.y, d = Math.sqrt(dx*dx + dy*dy), R = sh.sz * 0.7;
-    if (d < R && d > 0) {
-      const f = (1 - d / R) * sh.sz * 0.5;
-      ox += (dx / d) * f;
-      oy += (dy / d) * f;
+    // Rectangle in screen space
+    const rx = sh.x, ry = sh.y, rw = sh.w, rh = sh.h;
+
+    // Nearest point on rectangle surface to the screen-space point
+    const nearX = Math.max(rx, Math.min(sx, rx + rw));
+    const nearY = Math.max(ry, Math.min(y,  ry + rh));
+
+    const ddx = sx - nearX;
+    const ddy = y  - nearY;
+    const d   = Math.sqrt(ddx * ddx + ddy * ddy);
+
+    // Is the point inside the rectangle?
+    const inside = sx >= rx && sx <= rx + rw && y >= ry && y <= ry + rh;
+
+    if (inside) {
+      // Inside: push toward the nearest edge with force proportional to
+      // how deep the point is — points near the centre get pushed harder
+      // so they clear the rectangle completely.
+      const dLeft   = sx - rx;
+      const dRight  = rx + rw - sx;
+      const dTop    = y - ry;
+      const dBottom = ry + rh - y;
+      const minD    = Math.min(dLeft, dRight, dTop, dBottom);
+      // Force = at least F_RECT, plus extra for deeply embedded points
+      const push = F_RECT + minD * 0.8;
+
+      if      (minD === dLeft)   ox -= push;
+      else if (minD === dRight)  ox += push;
+      else if (minD === dTop)    oy -= push;
+      else                       oy += push;
+    } else if (d < R_RECT && d > 0) {
+      // Outside but within influence: soft falloff push away from surface
+      const f = (1 - d / R_RECT) * F_RECT;
+      ox += (ddx / d) * f;
+      oy += (ddy / d) * f;
     }
   }
+
   return { ox, oy };
+}
+
+/**
+ * Bend a flattened path so it flows AROUND rectangle obstacles rather than
+ * stopping abruptly at their edges. Applied to Terrain and Pathways only.
+ *
+ * For each point near a rectangle, the push is perpendicular to the local
+ * path direction — so lines arc left/right to avoid the obstacle instead of
+ * piling up against its face. The canvas clip (already active when this runs)
+ * handles the hard cutoff inside the rectangle; this function creates the
+ * natural flowing arc outside it.
+ *
+ * pts   — world-space points (already inside cx.translate(drift,0))
+ * drift — current spatial drift so we convert screen-space shape coords
+ *         to the same world space: wx = sh.x - drift
+ */
+function applyRectFlowDeform(pts, drift, radial = false) {
+  if (S.shapes.length === 0 || pts.length < 2) return pts;
+  const MARGIN = radial ? 90 : 120;
+  const result = new Array(pts.length);
+
+  for (let i = 0; i < pts.length; i++) {
+    const pt = pts[i];
+    let ox = 0, oy = 0;
+
+    for (const sh of S.shapes) {
+      const wx = sh.x - drift, wy = sh.y, ww = sh.w, wh = sh.h;
+      if (pt.x < wx - MARGIN || pt.x > wx + ww + MARGIN ||
+          pt.y < wy - MARGIN || pt.y > wy + wh + MARGIN) continue;
+
+      const nearX = Math.max(wx, Math.min(pt.x, wx + ww));
+      const nearY = Math.max(wy, Math.min(pt.y, wy + wh));
+      const ddx = pt.x - nearX, ddy = pt.y - nearY;
+      const d = Math.sqrt(ddx * ddx + ddy * ddy);
+      const inside = pt.x >= wx && pt.x <= wx + ww && pt.y >= wy && pt.y <= wy + wh;
+
+      if (radial) {
+        // ── Terrain: radial SDF push — away from nearest rect surface point.
+        // Each point is pushed directly outward from the rectangle boundary,
+        // so curved terrain contours bow smoothly without crossing.
+        if (inside || d < MARGIN) {
+          let nx, ny;
+          if (d > 0.01) {
+            nx = ddx / d; ny = ddy / d;
+          } else {
+            // Exactly at surface — push from rect centre outward
+            const rcx = wx + ww * 0.5, rcy = wy + wh * 0.5;
+            const cx = pt.x - rcx, cy = pt.y - rcy;
+            const cLen = Math.sqrt(cx * cx + cy * cy);
+            if (cLen < 0.01) { nx = 0; ny = -1; } else { nx = cx / cLen; ny = cy / cLen; }
+          }
+          const f = inside ? MARGIN * 1.1 : (1 - d / MARGIN) * MARGIN * 0.8;
+          ox += nx * f;
+          oy += ny * f;
+        }
+      } else {
+        // ── Pathways: perpendicular-to-path push — lines arc sideways around rect.
+        const prev = pts[Math.max(0, i - 1)];
+        const next = pts[Math.min(pts.length - 1, i + 1)];
+        let dirX = next.x - prev.x, dirY = next.y - prev.y;
+        const dLen = Math.sqrt(dirX * dirX + dirY * dirY);
+        if (dLen < 0.01) continue;
+        dirX /= dLen; dirY /= dLen;
+        const perpX = -dirY, perpY = dirX;
+        const rcx = wx + ww * 0.5, rcy = wy + wh * 0.5;
+        const dot = (pt.x - rcx) * perpX + (pt.y - rcy) * perpY;
+        const side = dot >= 0 ? 1 : -1;
+        if (inside || d < MARGIN) {
+          const f = inside ? MARGIN * 1.15 : (1 - d / MARGIN) * MARGIN * 0.85;
+          ox += side * perpX * f;
+          oy += side * perpY * f;
+        }
+      }
+    }
+
+    result[i] = { x: pt.x + ox, y: pt.y + oy };
+  }
+  return result;
+}
+
+// ================================================================
+// SHAPE OBSTACLE UTILITIES
+// ================================================================
+
+/** True if point (px,py) is inside any shape rectangle (with optional margin) */
+function ptInAnyShape(px, py, margin = 0) {
+  for (const sh of S.shapes) {
+    if (px >= sh.x - margin && px <= sh.x + sh.w + margin &&
+        py >= sh.y - margin && py <= sh.y + sh.h + margin) return true;
+  }
+  return false;
+}
+
+/** True if AABB (rx,ry,rw,rh) overlaps any shape rectangle */
+function rectOverlapsAnyShape(rx, ry, rw, rh) {
+  for (const sh of S.shapes) {
+    if (rx < sh.x + sh.w && rx + rw > sh.x &&
+        ry < sh.y + sh.h && ry + rh > sh.y) return true;
+  }
+  return false;
+}
+
+/** True if segment p0→p1 intersects rectangle rect={x,y,w,h} */
+function segCrossesRect(p0, p1, rect) {
+  const {x, y, w, h} = rect;
+  // Endpoint inside?
+  const inR = (p) => p.x >= x && p.x <= x+w && p.y >= y && p.y <= y+h;
+  if (inR(p0) || inR(p1)) return true;
+  // Segment vs each rect edge
+  function edgeIsect(ax,ay, bx,by, cx,cy, dx,dy) {
+    const d1x=bx-ax,d1y=by-ay,d2x=dx-cx,d2y=dy-cy;
+    const cr = d1x*d2y - d1y*d2x;
+    if (Math.abs(cr) < 1e-9) return false;
+    const t = ((cx-ax)*d2y - (cy-ay)*d2x) / cr;
+    const u = ((cx-ax)*d1y - (cy-ay)*d1x) / cr;
+    return t >= 0 && t <= 1 && u >= 0 && u <= 1;
+  }
+  return edgeIsect(p0.x,p0.y, p1.x,p1.y, x,y,   x+w,y  ) ||
+         edgeIsect(p0.x,p0.y, p1.x,p1.y, x+w,y,   x+w,y+h) ||
+         edgeIsect(p0.x,p0.y, p1.x,p1.y, x+w,y+h, x,y+h  ) ||
+         edgeIsect(p0.x,p0.y, p1.x,p1.y, x,y+h,   x,y    );
+}
+
+/** True if segment p0→p1 crosses any shape rectangle */
+function segCrossesAnyShape(p0, p1) {
+  for (const sh of S.shapes) { if (segCrossesRect(p0, p1, sh)) return true; }
+  return false;
+}
+
+/**
+ * Binary-search for the exact shape-boundary crossing point between p0 and p1.
+ * One endpoint must be inside (ptInAnyShape true), the other outside.
+ * Returns the point just outside the shape boundary.
+ */
+function findBoundaryPt(p0, p1, margin) {
+  let lo = ptInAnyShape(p0.x, p0.y, margin) ? p1 : p0;  // outside
+  let hi = ptInAnyShape(p0.x, p0.y, margin) ? p0 : p1;  // inside
+  for (let i = 0; i < 10; i++) {
+    const mid = { x: (lo.x + hi.x) * 0.5, y: (lo.y + hi.y) * 0.5 };
+    if (ptInAnyShape(mid.x, mid.y, margin)) hi = mid; else lo = mid;
+  }
+  return lo;
+}
+
+/**
+ * Split a path into sub-paths wherever it would cross a shape rectangle.
+ * Points inside shapes (with margin) are removed; boundary crossing points
+ * are inserted so every sub-path starts and stops cleanly at the shape edge.
+ * Returns an array of sub-path point arrays (may be empty if fully inside).
+ */
+function splitPathAtShapes(pts, margin = 12) {
+  if (S.shapes.length === 0 || pts.length < 2) return [pts];
+  const result = [];
+  let chain = null;
+
+  for (let i = 0; i < pts.length; i++) {
+    const pt = pts[i];
+    const inside = ptInAnyShape(pt.x, pt.y, margin);
+
+    if (!inside) {
+      if (i > 0 && ptInAnyShape(pts[i - 1].x, pts[i - 1].y, margin)) {
+        // Exiting a shape → find exact boundary point and start new chain
+        const bp = findBoundaryPt(pts[i - 1], pt, margin);
+        chain = [bp, pt];
+      } else {
+        if (!chain) chain = [pt]; else chain.push(pt);
+      }
+    } else {
+      // Entering a shape
+      if (i > 0 && !ptInAnyShape(pts[i - 1].x, pts[i - 1].y, margin)) {
+        // Was outside → find entry boundary point and close current chain
+        const bp = findBoundaryPt(pts[i - 1], pt, margin);
+        if (chain) chain.push(bp);
+      }
+      if (chain && chain.length >= 2) result.push(chain);
+      chain = null;
+    }
+  }
+
+  if (chain && chain.length >= 2) result.push(chain);
+  return result.length > 0 ? result : [];
+}
+
+/** Return the 4 corner handles for a shape rectangle */
+function getShapeHandles(sh) {
+  return [
+    { x: sh.x,       y: sh.y,       corner: 'tl' },
+    { x: sh.x+sh.w,  y: sh.y,       corner: 'tr' },
+    { x: sh.x,       y: sh.y+sh.h,  corner: 'bl' },
+    { x: sh.x+sh.w,  y: sh.y+sh.h,  corner: 'br' },
+  ];
+}
+
+/** Hit-test cursor position against all shapes. Returns {type,idx,corner} or null */
+function hitTestShapes(mx, my) {
+  const HR = 10; // handle hit radius in px
+  for (let i = S.shapes.length - 1; i >= 0; i--) {
+    const sh = S.shapes[i];
+    for (const h of getShapeHandles(sh)) {
+      if (Math.hypot(mx - h.x, my - h.y) < HR) return { type: 'handle', idx: i, corner: h.corner };
+    }
+    if (mx >= sh.x && mx <= sh.x+sh.w && my >= sh.y && my <= sh.y+sh.h)
+      return { type: 'body', idx: i };
+  }
+  return null;
+}
+
+/** Debounced rebuild trigger (used while drag is in progress) */
+let rebuildTimer = null;
+function scheduleRebuild() {
+  clearTimeout(rebuildTimer);
+  rebuildTimer = setTimeout(() => rebuild(), 60);
+}
+
+/**
+ * Route a single trunk segment p0→p1 around any shape obstacles.
+ * Returns an array of waypoints [p0, ...bypasses, p1] forming a rectilinear path.
+ * Horizontal segments detour vertically; vertical segments detour horizontally.
+ */
+function detourSegment(p0, p1) {
+  const waypoints = [p0];
+  const margin = 32;
+
+  for (const sh of S.shapes) {
+    const ex = { x: sh.x - margin, y: sh.y - margin, w: sh.w + margin*2, h: sh.h + margin*2 };
+    // Quick AABB reject
+    const sMinX = Math.min(p0.x,p1.x), sMaxX = Math.max(p0.x,p1.x);
+    const sMinY = Math.min(p0.y,p1.y), sMaxY = Math.max(p0.y,p1.y);
+    if (sMaxX < ex.x || sMinX > ex.x+ex.w || sMaxY < ex.y || sMinY > ex.y+ex.h) continue;
+    if (!segCrossesRect(p0, p1, ex)) continue;
+
+    const dx = Math.abs(p1.x - p0.x), dy = Math.abs(p1.y - p0.y);
+    if (dx > dy) {
+      // Horizontal segment — bypass above or below
+      const goAbove = p0.y <= sh.y + sh.h * 0.5;
+      const byY = goAbove ? ex.y : ex.y + ex.h;
+      const enterX = Math.min(Math.max(ex.x,       sMinX), sMaxX);
+      const exitX  = Math.min(Math.max(ex.x+ex.w,  sMinX), sMaxX);
+      waypoints.push({ x: enterX, y: byY });
+      waypoints.push({ x: exitX,  y: byY });
+    } else {
+      // Vertical segment — bypass left or right
+      const goLeft = p0.x <= sh.x + sh.w * 0.5;
+      const byX = goLeft ? ex.x : ex.x + ex.w;
+      const enterY = Math.min(Math.max(ex.y,       sMinY), sMaxY);
+      const exitY  = Math.min(Math.max(ex.y+ex.h,  sMinY), sMaxY);
+      waypoints.push({ x: byX, y: enterY });
+      waypoints.push({ x: byX, y: exitY  });
+    }
+  }
+  waypoints.push(p1);
+  return waypoints;
+}
+
+/** Expand a trunk polyline with rectilinear detours around all shape obstacles */
+function buildTrunkWithDetours(trunk) {
+  const result = [];
+  for (let i = 0; i < trunk.length - 1; i++) {
+    const seg = detourSegment(trunk[i], trunk[i+1]);
+    if (i === 0) result.push(...seg);
+    else result.push(...seg.slice(1));
+  }
+  return result;
+}
+
+/** Split a chain of points wherever any point is inside a shape rectangle.
+ *  Returns array of sub-chains (each min minLen points). */
+function splitChainAtShapes(chain, minLen = 6) {
+  if (S.shapes.length === 0) return [chain];
+  const result = [];
+  let current = [];
+  for (const pt of chain) {
+    if (!ptInAnyShape(pt.x, pt.y)) {
+      current.push(pt);
+    } else {
+      if (current.length >= minLen) result.push(current);
+      current = [];
+    }
+  }
+  if (current.length >= minLen) result.push(current);
+  return result;
 }
 
 /**
@@ -1442,6 +1906,47 @@ function drawUnits(ctx, flat, off, color) {
 }
 
 /**
+ * Deform/split a path for rectangle interaction. Different per pattern:
+ *
+ * TERRAIN: Split path at rectangle boundaries → clean rectangular void.
+ *   Uses splitPathAtShapes for precise geometric cutting. Returns array of
+ *   sub-path flattenings that get drawn independently.
+ *
+ * PATHWAYS: Per-point SDF repulsion. Each individual point near the rectangle
+ *   gets pushed outward so the path curves/wraps around the obstacle. The path
+ *   stays in its general position but locally deforms.
+ *
+ * CITY: Centroid-based uniform translation (keeps rectangles axis-aligned).
+ *   Blocks stay horizontal/vertical. Road spacing is preserved.
+ *
+ * NETWORKS: Endpoint-only repulsion with straight re-interpolation.
+ */
+function deformPath(p, drift) {
+  // ── CITY / NETWORKS: no deformation — clip + rebuild handles the void ──
+  if (p.rigid) {
+    return [flattenPath(p.pts)];
+  }
+
+  // ── TERRAIN: geometric split at rectangle boundaries ──
+  // Contour lines are cleanly cut where they cross the rectangle edge.
+  // No repulsion — lines end precisely at the boundary. The canvas clip
+  // provides a safety net for any edge artifacts.
+  if (S.pattern === 'terrain' && S.shapes.length > 0) {
+    const savedShapes = S.shapes;
+    S.shapes = S.shapes.map(sh => ({ x: sh.x - drift, y: sh.y, w: sh.w, h: sh.h }));
+    const subPaths = splitPathAtShapes(p.pts, 4);
+    S.shapes = savedShapes;
+    if (subPaths.length === 0) return [];
+    return subPaths.map(sp => flattenPath(sp));
+  }
+
+  // ── PATHWAYS / DEFAULT: no deformation ──
+  // Pathways use precise parallel-offset arc geometry; per-point repulsion
+  // would break the non-crossing guarantee, causing lines to touch/overlap.
+  return [flattenPath(p.pts)];
+}
+
+/**
  * Main render loop: animate and draw all pattern paths
  * Handles path flattening with interaction deformation
  */
@@ -1459,6 +1964,16 @@ function draw() {
   if (S.movement === 'spatial') S.spatialX += 0.004;
   const drift = S.movement === 'spatial' ? Math.sin(S.spatialX) * 120 : 0;
 
+  // Networks in spatial mode: rebuild periodically so edge clipping
+  // stays aligned with the drifting rectangle position.
+  if (S.movement === 'spatial' && S.shapes.length > 0 && S.pattern === 'networks') {
+    if (draw._lastDrift === undefined) draw._lastDrift = drift;
+    if (Math.abs(drift - draw._lastDrift) > 8) {
+      draw._lastDrift = drift;
+      rebuild();
+    }
+  }
+
   // ── Clear + fill background ───────────────────────────────────────
   cx.clearRect(0, 0, W, H);
   cx.fillStyle = S.canvasBg;
@@ -1468,53 +1983,152 @@ function draw() {
   cx.save();
   cx.translate(drift, 0);
 
-  for (const p of paths) {
-    let flat_r;
-    if (p.flat) {
-      flat_r = p.flat;
-    } else {
-      const deformedPts = p.pts.map(pt => {
-        const d = repulse(pt.x, pt.y);
-        return { x: pt.x + d.ox, y: pt.y + d.oy };
-      });
-      flat_r = flattenPath(deformedPts);
+  // Clip a screen-fixed rectangular void so the gap stays anchored to the
+  // rectangle even when patterns drift in spatial mode.
+  if (S.shapes.length > 0 && (S.pattern === 'city' || S.pattern === 'networks' || S.pattern === 'terrain')) {
+    const CBLEED = 400;
+    cx.beginPath();
+    cx.rect(-CBLEED - Math.abs(drift), -CBLEED,
+            W + CBLEED * 2 + Math.abs(drift) * 2, H + CBLEED * 2);
+    for (const sh of S.shapes) {
+      cx.rect(sh.x - drift, sh.y, sh.w, sh.h);
     }
-    drawUnits(cx, flat_r, p.off, S.lineColor);
+    cx.clip('evenodd');
+  }
+
+  for (const p of paths) {
+    // Skip screen-fixed paths here — drawn outside drift translate below
+    if (p.screenFixed) continue;
+
+    // City blocks in spatial mode: re-clip blockPoly against shapes every frame
+    // so block edges track the rectangle smoothly as the pattern drifts.
+    if (p.blockPoly && S.shapes.length > 0) {
+      const halfRd = p.blockRoadW * 0.5;
+      const MIN_BLK = p.blockRoadW * 0.8;
+      let fragments = [p.blockPoly];
+      for (const sh of S.shapes) {
+        // Shape is screen-fixed; convert to world-space by subtracting drift
+        const rx = sh.x - drift - halfRd, ry = sh.y - halfRd;
+        const rw = sh.w + p.blockRoadW, rh = sh.h + p.blockRoadW;
+        const next = [];
+        for (const poly of fragments) {
+          const clipped = clipPolyByRect(poly, rx, ry, rw, rh);
+          for (const frag of clipped) next.push(frag);
+        }
+        fragments = next;
+      }
+      // Draw each surviving fragment
+      for (const frag of fragments) {
+        let fMinX = Infinity, fMaxX = -Infinity, fMinY = Infinity, fMaxY = -Infinity;
+        for (const pt of frag) {
+          if (pt.x < fMinX) fMinX = pt.x; if (pt.x > fMaxX) fMaxX = pt.x;
+          if (pt.y < fMinY) fMinY = pt.y; if (pt.y > fMaxY) fMaxY = pt.y;
+        }
+        if (fMaxX - fMinX < MIN_BLK || fMaxY - fMinY < MIN_BLK) continue;
+        const ring = [...frag, frag[0]];
+        const fragPts = [];
+        for (let i = 0; i < ring.length - 1; i++) {
+          const a = ring[i], b = ring[i + 1];
+          const ex = b.x - a.x, ey = b.y - a.y;
+          const steps = Math.ceil(Math.hypot(ex, ey) / 8);
+          for (let j = 0; j < steps; j++) {
+            const t = j / steps;
+            fragPts.push({ x: a.x + ex * t, y: a.y + ey * t });
+          }
+        }
+        fragPts.push(fragPts[0]);
+        if (fragPts.length > 4) {
+          drawUnits(cx, flattenPath(fragPts), p.off, S.lineColor);
+        }
+      }
+      continue;
+    }
+
+    if (p.flat) {
+      drawUnits(cx, p.flat, p.off, S.lineColor);
+    } else {
+      const subs = deformPath(p, drift);
+      for (const flat_r of subs) {
+        drawUnits(cx, flat_r, p.off, S.lineColor);
+      }
+    }
   }
 
   if (S.pattern === 'networks' && S.networkNodes) {
     cx.fillStyle = S.lineColor;
     for (const n of S.networkNodes) {
-      const d = repulse(n.x, n.y);
       cx.beginPath();
-      cx.arc(n.x + d.ox, n.y + d.oy, CR, 0, Math.PI * 2);
+      cx.arc(n.x, n.y, CR, 0, Math.PI * 2);
       cx.fill();
     }
   }
 
   cx.restore();
 
-  // ── Placed shape obstacles always at fixed canvas coords ─────────
+  // ── Screen-fixed paths (e.g. network rectangle perimeter) ──────────
+  for (const p of paths) {
+    if (!p.screenFixed) continue;
+    const flat_r = flattenPath(p.pts);
+    drawUnits(cx, flat_r, p.off, S.lineColor);
+  }
+
+  // ── Network: dynamic corner-to-node connections + corner dots ──
+  // Drawn every frame so connections track the nearest node as the
+  // pattern drifts in spatial mode. Each corner connects to the closest
+  // node in screen space.
+  if (S.pattern === 'networks' && S.networkNodes && S.shapes.length > 0) {
+    for (const sh of S.shapes) {
+      const corners = [
+        { x: sh.x, y: sh.y }, { x: sh.x + sh.w, y: sh.y },
+        { x: sh.x + sh.w, y: sh.y + sh.h }, { x: sh.x, y: sh.y + sh.h }
+      ];
+      for (const c of corners) {
+        // Find nearest node in screen space
+        let bestD = Infinity, bestN = null;
+        for (const n of S.networkNodes) {
+          const screenX = n.x + drift;
+          const d = Math.hypot(c.x - screenX, c.y - n.y);
+          if (d < bestD) { bestD = d; bestN = n; }
+        }
+        if (bestN && bestD < 600) {
+          // Draw connection line from corner (screen) to node (screen)
+          const nx = bestN.x + drift, ny = bestN.y;
+          const dx = nx - c.x, dy = ny - c.y;
+          const steps = Math.max(1, Math.ceil(Math.hypot(dx, dy) / 6));
+          const pts = [];
+          for (let j = 0; j <= steps; j++) {
+            const t = j / steps;
+            pts.push({ x: c.x + dx * t, y: c.y + dy * t });
+          }
+          drawUnits(cx, flattenPath(pts), 0, S.lineColor);
+        }
+        // Corner dot
+        cx.fillStyle = S.lineColor;
+        cx.beginPath();
+        cx.arc(c.x, c.y, CR, 0, Math.PI * 2);
+        cx.fill();
+      }
+    }
+  }
+
+  // ── Rectangle obstacles — always at fixed canvas coords ──
   for (const sh of S.shapes) {
     cx.save();
     cx.strokeStyle = S.lineColor;
-    cx.lineWidth = 1;
-    cx.setLineDash([3, 4]);
-    cx.globalAlpha = 0.22;
-    cx.beginPath();
-    if (sh.type === 'circle') {
-      cx.arc(sh.x, sh.y, sh.sz * 0.5, 0, Math.PI * 2);
-    } else if (sh.type === 'square') {
-      const h = sh.sz * 0.5;
-      cx.rect(sh.x - h, sh.y - h, h * 2, h * 2);
-    } else if (sh.type === 'triangle') {
-      const h = sh.sz * 0.55;
-      cx.moveTo(sh.x, sh.y - h);
-      cx.lineTo(sh.x + h * 0.87, sh.y + h * 0.5);
-      cx.lineTo(sh.x - h * 0.87, sh.y + h * 0.5);
-      cx.closePath();
+    cx.lineWidth = 1.5;
+    cx.setLineDash([5, 5]);
+    cx.globalAlpha = 0.45;
+    cx.strokeRect(sh.x, sh.y, sh.w, sh.h);
+    cx.restore();
+    // Corner resize handles
+    cx.save();
+    cx.fillStyle = S.lineColor;
+    cx.globalAlpha = 0.7;
+    for (const h of getShapeHandles(sh)) {
+      cx.beginPath();
+      cx.arc(h.x, h.y, 5, 0, Math.PI * 2);
+      cx.fill();
     }
-    cx.stroke();
     cx.restore();
   }
 }
@@ -1526,24 +2140,96 @@ let animId;
 // CANVAS INTERACTION
 // ================================================================
 const cursorRing = document.getElementById('cursor-ring');
+let shapeDrag = null;   // null | {type:'body'|'handle', idx, corner, startMx, startMy, startX, startY, startW, startH}
+
 cv.addEventListener('mousemove', e => {
   const r = cv.getBoundingClientRect();
   S.mx = e.clientX - r.left; S.my = e.clientY - r.top;
   cursorRing.style.left = S.mx+'px'; cursorRing.style.top = S.my+'px';
+
+  // Update cursor style based on what's under the mouse
+  if (!shapeDrag && S.mode === 'active' && S.shapes.length > 0) {
+    const hit = hitTestShapes(S.mx, S.my);
+    if (hit) {
+      cv.style.cursor = hit.type === 'handle' ? 'nwse-resize' : 'move';
+    } else {
+      cv.style.cursor = 'crosshair';
+    }
+  } else if (!shapeDrag) {
+    cv.style.cursor = '';
+  }
+
+  if (!shapeDrag) return;
+  const dx = S.mx - shapeDrag.startMx, dy = S.my - shapeDrag.startMy;
+  const sh = S.shapes[shapeDrag.idx];
+  const MIN_W = 40, MIN_H = 30;
+
+  if (shapeDrag.type === 'body') {
+    sh.x = shapeDrag.startX + dx;
+    sh.y = shapeDrag.startY + dy;
+  } else {
+    const c = shapeDrag.corner;
+    if (c === 'tl') {
+      sh.x = Math.min(shapeDrag.startX + dx, shapeDrag.startX + shapeDrag.startW - MIN_W);
+      sh.y = Math.min(shapeDrag.startY + dy, shapeDrag.startY + shapeDrag.startH - MIN_H);
+      sh.w = shapeDrag.startW - (sh.x - shapeDrag.startX);
+      sh.h = shapeDrag.startH - (sh.y - shapeDrag.startY);
+    } else if (c === 'tr') {
+      sh.y = Math.min(shapeDrag.startY + dy, shapeDrag.startY + shapeDrag.startH - MIN_H);
+      sh.w = Math.max(MIN_W, shapeDrag.startW + dx);
+      sh.h = shapeDrag.startH - (sh.y - shapeDrag.startY);
+    } else if (c === 'bl') {
+      sh.x = Math.min(shapeDrag.startX + dx, shapeDrag.startX + shapeDrag.startW - MIN_W);
+      sh.w = shapeDrag.startW - (sh.x - shapeDrag.startX);
+      sh.h = Math.max(MIN_H, shapeDrag.startH + dy);
+    } else { // br
+      sh.w = Math.max(MIN_W, shapeDrag.startW + dx);
+      sh.h = Math.max(MIN_H, shapeDrag.startH + dy);
+    }
+  }
+  // Rectangle repulsion is applied per-frame via repulse() — no rebuild needed during drag.
 });
+
 cv.addEventListener('mouseleave', () => { S.mx=-9999; S.my=-9999; });
-cv.addEventListener('click', e => {
+
+cv.addEventListener('mousedown', e => {
   if (S.mode !== 'active') return;
   const r = cv.getBoundingClientRect();
-  S.shapes.push({ x: e.clientX-r.left, y: e.clientY-r.top, type: S.selectedShape, sz: 80+Math.random()*40 });
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+
+  const hit = hitTestShapes(mx, my);
+  if (hit) {
+    const sh = S.shapes[hit.idx];
+    shapeDrag = { ...hit, startMx: mx, startMy: my, startX: sh.x, startY: sh.y, startW: sh.w, startH: sh.h };
+    e.preventDefault();
+  }
+  // Click-to-place is handled by the toolbar button
 });
-document.getElementById('clrBtn').addEventListener('click', () => S.shapes = []);
-document.querySelectorAll('.shape-btn[data-shape]').forEach(b => {
-  b.addEventListener('click', () => {
-    S.selectedShape = b.dataset.shape;
-    document.querySelectorAll('.shape-btn[data-shape]').forEach(x => x.classList.remove('is-active'));
-    b.classList.add('is-active');
-  });
+
+cv.addEventListener('mouseup', () => {
+  if (shapeDrag) {
+    shapeDrag = null;
+    clearTimeout(rebuildTimer);
+    rebuild(); // Bake final rect position into city/network geometry
+  }
+  shapeDrag = null;
+});
+
+document.getElementById('addRectBtn').addEventListener('click', () => {
+  if (S.shapes.length >= 3) { toast('Maximum 3 rectangles'); return; }
+  // Place rectangle in a staggered position near center
+  const idx = S.shapes.length;
+  const W0 = 200, H0 = 130;
+  const offsets = [{dx:0,dy:0},{dx:80,dy:60},{dx:-70,dy:80}];
+  const cx0 = W * 0.5 + offsets[idx].dx, cy0 = H * 0.5 + offsets[idx].dy;
+  S.shapes.push({ x: cx0 - W0/2, y: cy0 - H0/2, w: W0, h: H0 });
+  rebuild();
+});
+
+document.getElementById('clrBtn').addEventListener('click', () => {
+  S.shapes = [];
+  shapeDrag = null;
+  rebuild();
 });
 
 // ================================================================
@@ -1699,7 +2385,7 @@ setupSlider('densityRange', 'densityBadge', false, v => { S.density = v; rebuild
 setupSlider('seedRange',    'seedBadge',    true,  v => { S.seed = v; rebuildWithTransition(); });
 
 document.getElementById('resetBtn').addEventListener('click', () => {
-  S.speed=.5; S.density=.5; S.seed=5; S.shapes=[]; S.movement='fixed'; S.spatialX=0;
+  S.speed=.5; S.density=.5; S.seed=5; S.shapes=[]; S.movement='fixed'; S.spatialX=0; shapeDrag=null;
   document.getElementById('speedRange').value   = 50;
   document.getElementById('densityRange').value = 50;
   document.getElementById('seedRange').value    = 5;
@@ -1734,8 +2420,13 @@ function exportImg(fname, type, transp) {
   const tx = tc.getContext('2d');
   if (!transp) { tx.fillStyle=S.canvasBg; tx.fillRect(0,0,EW,EH); }
   tx.save(); tx.scale(EW/W, EH/H);
-  for (const p of paths) drawUnits(tx, p.flat || flattenPath(p.pts), p.off, S.lineColor);
-  if(S.networkNodes){tx.fillStyle=S.lineColor;for(const n of S.networkNodes){tx.beginPath();tx.arc(n.x,n.y,CR,0,Math.PI*2);tx.fill();}}
+  for (const p of paths) {
+    const subs = deformPath(p, 0);
+    for (const flat_r of subs) {
+      drawUnits(tx, flat_r, p.off, S.lineColor);
+    }
+  }
+  if(S.networkNodes){tx.fillStyle=S.lineColor;for(const n of S.networkNodes){const d=repulse(n.x,n.y,0);tx.beginPath();tx.arc(n.x+d.ox,n.y+d.oy,CR,0,Math.PI*2);tx.fill();}}
   tx.restore();
   const a=document.createElement('a'); a.download=fname;
   a.href=type==='jpg'?tc.toDataURL('image/jpeg',.95):tc.toDataURL('image/png');
@@ -1749,23 +2440,24 @@ document.getElementById('exSvg').addEventListener('click', () => {
   let body = '';
   // Build unit positions for each path and emit SVG circles + rects
   for (const p of paths) {
-    const flat = p.flat || flattenPath(p.pts);
+    const subs = deformPath(p, 0);
+    for (const flat of subs) {
     if (flat.length < 2) continue;
     const dists = [0];
     for (let i=1;i<flat.length;i++) dists.push(dists[i-1]+Math.hypot(flat[i].x-flat[i-1].x,flat[i].y-flat[i-1].y));
     const totalLen = dists[dists.length-1];
-    function atD(d) {
+    const atDFn = d => {
       d=Math.max(0,Math.min(totalLen,d));
       let lo=0,hi=dists.length-1;
       while(hi-lo>1){const mid=(lo+hi)>>1;if(dists[mid]<=d)lo=mid;else hi=mid;}
       const segLen=dists[hi]-dists[lo],t=segLen>0?(d-dists[lo])/segLen:0;
       return{x:flat[lo].x+(flat[hi].x-flat[lo].x)*t,y:flat[lo].y+(flat[hi].y-flat[lo].y)*t,
              angle:Math.atan2(flat[hi].y-flat[lo].y,flat[hi].x-flat[lo].x)};
-    }
+    };
     for (let d=-(p.off%UNIT);d<totalLen;d+=UNIT) {
       // Circle unit
       const cD=d+CR;
-      if(cD>=-CR&&cD<=totalLen+CR){const pt=atD(cD);body+=`<circle cx="${pt.x.toFixed(1)}" cy="${pt.y.toFixed(1)}" r="${CR}" fill="${col}"/>\n`;}
+      if(cD>=-CR&&cD<=totalLen+CR){const pt=atDFn(cD);body+=`<circle cx="${pt.x.toFixed(1)}" cy="${pt.y.toFixed(1)}" r="${CR}" fill="${col}"/>\n`;}
       // Bar unit — polygon ribbon that bends along the path (matches canvas drawUnits exactly)
       const bStart=d+CR*2+GAP, bEnd=bStart+BW;
       if(bEnd>=0&&bStart<=totalLen){
@@ -1773,7 +2465,7 @@ document.getElementById('exSvg').addEventListener('click', () => {
         const steps=Math.max(2,Math.ceil((ce-cs)/3));
         const top=[], bot=[];
         for(let si=0;si<=steps;si++){
-          const pt=atD(cs+(ce-cs)*si/steps);
+          const pt=atDFn(cs+(ce-cs)*si/steps);
           const nx=-Math.sin(pt.angle), ny=Math.cos(pt.angle);
           top.push(`${(pt.x+nx*BH/2).toFixed(1)},${(pt.y+ny*BH/2).toFixed(1)}`);
           bot.push(`${(pt.x-nx*BH/2).toFixed(1)},${(pt.y-ny*BH/2).toFixed(1)}`);
@@ -1781,9 +2473,12 @@ document.getElementById('exSvg').addEventListener('click', () => {
         body+=`<polygon points="${[...top,...bot.reverse()].join(' ')}" fill="${col}"/>\n`;
       }
     }
+    }
   }
-  if(S.networkNodes){for(const n of S.networkNodes){body+=`<circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${CR}" fill="${col}"/>\n`;}}
-  const svg=`<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}">\n${body}</svg>`;
+  if(S.networkNodes){for(const n of S.networkNodes){const d=repulse(n.x,n.y,0);body+=`<circle cx="${(n.x+d.ox).toFixed(1)}" cy="${(n.y+d.oy).toFixed(1)}" r="${CR}" fill="${col}"/>\n`;}}
+
+  const bgRect = `<rect width="${W}" height="${H}" fill="${S.canvasBg}"/>\n`;
+  const svg=`<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}">\n${bgRect}<g>\n${body}</g>\n</svg>`;
   const a=document.createElement('a'); a.download='pattern.svg';
   a.href=URL.createObjectURL(new Blob([svg],{type:'image/svg+xml'})); a.click();
   toast('Exported SVG');
@@ -1801,9 +2496,9 @@ document.getElementById('exVideo').addEventListener('click', async () => {
   // Uses gifenc (MIT, ~12 KB) loaded via fetch→blob so it works from file://,
   // GitHub Pages, or any HTTPS host without import() cross-origin restrictions.
 
-  const GIF_FPS    = 50;
-  const GIF_FRAMES = 200;                             // 4 s loop at 50 fps
-  const GIF_DELAY  = Math.round(100 / GIF_FPS);      // centiseconds per frame (= 2cs = 20ms, browser min)
+  const GIF_FPS    = 25;
+  const GIF_FRAMES = 120;                    // 4.8 s loop at 25 fps
+  const GIF_DELAY  = 4;                      // 4cs = 40ms — well above browser minimum, universally honoured
   const SPATIAL_STEP = (2 * Math.PI) / GIF_FRAMES;   // exactly one sine cycle
   const sm = 0.5 + S.speed * 3;
   const saved = paths.map(p => p.off);
@@ -1836,24 +2531,21 @@ document.getElementById('exVideo').addEventListener('click', async () => {
     ctx.scale(tw / W, th / H);
     ctx.save();
     ctx.translate(drift, 0);
-    for (const p of paths)
-      drawUnits(ctx, p.flat || flattenPath(p.pts), p.off, S.lineColor);
+    for (const p of paths) {
+      const subs = deformPath(p, drift);
+      for (const flat_r of subs) {
+        drawUnits(ctx, flat_r, p.off, S.lineColor);
+      }
+    }
     if (S.pattern === 'networks' && S.networkNodes) {
       ctx.fillStyle = S.lineColor;
-      for (const n of S.networkNodes) { ctx.beginPath(); ctx.arc(n.x, n.y, CR, 0, Math.PI * 2); ctx.fill(); }
+      for (const n of S.networkNodes) {
+        const d = repulse(n.x, n.y, drift);
+        ctx.beginPath(); ctx.arc(n.x + d.ox, n.y + d.oy, CR, 0, Math.PI * 2); ctx.fill();
+      }
     }
-    ctx.restore();
-    for (const sh of S.shapes) {
-      ctx.save();
-      ctx.strokeStyle = S.lineColor; ctx.lineWidth = 1;
-      ctx.setLineDash([3, 4]); ctx.globalAlpha = 0.22;
-      ctx.beginPath();
-      if (sh.type === 'circle') { ctx.arc(sh.x, sh.y, sh.sz * 0.5, 0, Math.PI * 2); }
-      else if (sh.type === 'square') { const h = sh.sz * 0.5; ctx.rect(sh.x - h, sh.y - h, h * 2, h * 2); }
-      else if (sh.type === 'triangle') { const h = sh.sz * 0.55; ctx.moveTo(sh.x, sh.y - h); ctx.lineTo(sh.x + h * 0.87, sh.y + h * 0.5); ctx.lineTo(sh.x - h * 0.87, sh.y + h * 0.5); ctx.closePath(); }
-      ctx.stroke(); ctx.restore();
-    }
-    ctx.restore();
+    ctx.restore(); // inner (drift)
+    ctx.restore(); // outer (scale)
   }
 
   try {
@@ -1871,7 +2563,7 @@ document.getElementById('exVideo').addEventListener('click', async () => {
 
     btn.textContent = '● Encoding GIF…';
 
-    const EW = 1920, EH = 1080;
+    const EW = 960, EH = 540;   // half-res: 4× fewer pixels → smooth 25 fps in all viewers/apps
     const oc = document.createElement('canvas'); oc.width = EW; oc.height = EH;
     const octx = oc.getContext('2d');
 
@@ -1906,7 +2598,7 @@ document.getElementById('exVideo').addEventListener('click', async () => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.download = 'pattern-loop.gif'; a.href = url; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
-    toast('Exported GIF — 1920×1080, seamless loop');
+    toast('Exported GIF — 960×540 HD, seamless loop');
 
   } catch (e) {
     console.error('GIF export error:', e);
@@ -1921,6 +2613,9 @@ document.getElementById('exVideo').addEventListener('click', async () => {
 // ================================================================
 (function initDefaults() {
   applyTheme('light', false);
+  // Sync initial UI state — mode is 'active' by default
+  stage.classList.add('active-mode');
+  document.getElementById('shape-toolbar').classList.add('visible');
 })();
 
 resize();
