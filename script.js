@@ -2435,27 +2435,195 @@ function toast(msg) {
 // ================================================================
 // EXPORTS
 // ================================================================
-function exportImg(fname, type, transp) {
-  const EW = 1920, EH = 1080;
-  const tc = document.createElement('canvas'); tc.width=EW; tc.height=EH;
-  const tx = tc.getContext('2d');
-  if (!transp) { tx.fillStyle=S.canvasBg; tx.fillRect(0,0,EW,EH); }
-  tx.save(); tx.scale(EW/W, EH/H);
-  for (const p of paths) {
-    const subs = deformPath(p, 0);
-    for (const flat_r of subs) {
-      drawUnits(tx, flat_r, p.off, S.lineColor);
-    }
+
+// CRC32 for PNG pHYs DPI injection
+const _crc32Table = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) c = (c & 1) ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[i] = c;
   }
-  if(S.networkNodes){tx.fillStyle=S.lineColor;for(const n of S.networkNodes){const d=repulse(n.x,n.y,0);tx.beginPath();tx.arc(n.x+d.ox,n.y+d.oy,CR,0,Math.PI*2);tx.fill();}}
-  tx.restore();
-  const a=document.createElement('a'); a.download=fname;
-  a.href=type==='jpg'?tc.toDataURL('image/jpeg',.95):tc.toDataURL('image/png');
-  a.click(); toast('Exported '+fname+' (1920×1080)');
+  return t;
+})();
+function _crc32(buf, start, end) {
+  let crc = 0xFFFFFFFF;
+  for (let i = start; i < end; i++) crc = _crc32Table[(crc ^ buf[i]) & 0xFF] ^ (crc >>> 8);
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+function injectPNGpHYs(arrayBuf, dpi) {
+  const ppm = Math.round(dpi / 0.0254); // pixels per meter
+  const src = new Uint8Array(arrayBuf);
+  // pHYs chunk: 4(len)+4(type)+9(data)+4(crc) = 21 bytes
+  const phys = new Uint8Array(21);
+  phys[3] = 9; // length = 9
+  phys[4]=0x70; phys[5]=0x48; phys[6]=0x59; phys[7]=0x73; // "pHYs"
+  phys[8]=(ppm>>24)&0xFF; phys[9]=(ppm>>16)&0xFF; phys[10]=(ppm>>8)&0xFF; phys[11]=ppm&0xFF; // X ppm
+  phys[12]=(ppm>>24)&0xFF; phys[13]=(ppm>>16)&0xFF; phys[14]=(ppm>>8)&0xFF; phys[15]=ppm&0xFF; // Y ppm
+  phys[16] = 1; // unit = meter
+  const c = _crc32(phys, 4, 17);
+  phys[17]=(c>>24)&0xFF; phys[18]=(c>>16)&0xFF; phys[19]=(c>>8)&0xFF; phys[20]=c&0xFF;
+  // Insert after IHDR (8 sig + 25 IHDR = byte 33)
+  const out = new Uint8Array(src.length + 21);
+  out.set(src.slice(0, 33)); out.set(phys, 33); out.set(src.slice(33), 54);
+  return out;
 }
 
-document.getElementById('exPng').addEventListener('click', () => exportImg('pattern.png','png',true));   // transparent bg
-document.getElementById('exJpg').addEventListener('click', () => exportImg('pattern.jpg','jpg',false));  // with bg
+// Draw network corner-to-node connections in the CURRENT context coordinate space.
+// Call this inside an already-scaled context (same level as paths), with drift in screen-space.
+function drawNetworkCornerConnections(ctx, drift) {
+  if (S.pattern !== 'networks' || !S.networkNodes || !S.shapes.length) return;
+  for (const sh of S.shapes) {
+    const corners = [
+      { x: sh.x, y: sh.y }, { x: sh.x + sh.w, y: sh.y },
+      { x: sh.x + sh.w, y: sh.y + sh.h }, { x: sh.x, y: sh.y + sh.h }
+    ];
+    for (const c of corners) {
+      let bestD = Infinity, bestN = null;
+      for (const n of S.networkNodes) {
+        const d = Math.hypot(c.x - (n.x + drift), c.y - n.y);
+        if (d < bestD) { bestD = d; bestN = n; }
+      }
+      if (bestN && bestD < 600) {
+        const nx = bestN.x + drift, ny = bestN.y;
+        const dx = nx - c.x, dy = ny - c.y;
+        const steps = Math.max(1, Math.ceil(Math.hypot(dx, dy) / 6));
+        const pts = [];
+        for (let j = 0; j <= steps; j++) {
+          const t = j / steps;
+          pts.push({ x: c.x + dx * t, y: c.y + dy * t });
+        }
+        drawUnits(ctx, flattenPath(pts), 0, S.lineColor);
+      }
+      ctx.fillStyle = S.lineColor;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, CR, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+// Draw rectangle perimeter edges with drawUnits treatment (same as pattern lines).
+// ctx must be in scaled world-space coordinates. Used after void punch so outlines
+// appear on top of the empty void area.
+function drawExportPerimeters(ctx) {
+  // Network: screenFixed perimeter paths already built in paths array
+  for (const p of paths) {
+    if (!p.screenFixed) continue;
+    drawUnits(ctx, flattenPath(p.pts), p.off, S.lineColor);
+  }
+  // City: no perimeter lines in export — the void gap speaks for itself
+}
+
+// Draw all paths into ctx (already in scaled + drift-translated space).
+// City blocks are re-clipped against shapes with road spacing. No canvas clip used here —
+// the caller must punch the void with clearRect/fillRect after this returns.
+function drawExportPaths(ctx, drift) {
+  for (const p of paths) {
+    if (p.screenFixed) continue;
+    // City blocks: re-clip against shapes each frame (mirrors live draw logic)
+    if (p.blockPoly && S.shapes.length > 0) {
+      const halfRd = p.blockRoadW * 0.5;
+      const MIN_BLK = p.blockRoadW * 0.8;
+      let fragments = [p.blockPoly];
+      for (const sh of S.shapes) {
+        const rx = sh.x - drift - halfRd, ry = sh.y - halfRd;
+        const rw = sh.w + p.blockRoadW, rh = sh.h + p.blockRoadW;
+        const next = [];
+        for (const poly of fragments) {
+          for (const frag of clipPolyByRect(poly, rx, ry, rw, rh)) next.push(frag);
+        }
+        fragments = next;
+      }
+      for (const frag of fragments) {
+        let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
+        for (const pt of frag) {
+          if (pt.x<minX) minX=pt.x; if (pt.x>maxX) maxX=pt.x;
+          if (pt.y<minY) minY=pt.y; if (pt.y>maxY) maxY=pt.y;
+        }
+        if (maxX-minX < MIN_BLK || maxY-minY < MIN_BLK) continue;
+        const ring = [...frag, frag[0]];
+        const pts = [];
+        for (let i=0; i<ring.length-1; i++) {
+          const a=ring[i], b=ring[i+1];
+          const steps = Math.ceil(Math.hypot(b.x-a.x, b.y-a.y) / 8);
+          for (let j=0; j<steps; j++) { const t=j/steps; pts.push({x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t}); }
+        }
+        pts.push(pts[0]);
+        drawUnits(ctx, flattenPath(pts), p.off, S.lineColor);
+      }
+    } else {
+      const subs = deformPath(p, drift);
+      for (const flat_r of subs) drawUnits(ctx, flat_r, p.off, S.lineColor);
+    }
+  }
+}
+
+function renderPatternToCanvas(ew, eh) {
+  const tc = document.createElement('canvas'); tc.width=ew; tc.height=eh;
+  const tx = tc.getContext('2d');
+  const sx = ew / W, sy = eh / H;
+
+  // Phase 1: Draw pattern paths (city blocks re-clipped, network lines, terrain splits)
+  tx.save();
+  tx.scale(sx, sy);
+  drawExportPaths(tx, 0);
+  tx.restore();
+
+  // Phase 2: Punch void — clearRect creates transparent hole (PNG) or lets JPG bg show through
+  if (S.shapes.length > 0 && (S.pattern === 'city' || S.pattern === 'networks')) {
+    for (const sh of S.shapes) {
+      tx.clearRect(sh.x * sx, sh.y * sy, sh.w * sx, sh.h * sy);
+    }
+  }
+
+  // Phase 3: Draw perimeters + connections ON TOP of the void boundary
+  tx.save();
+  tx.scale(sx, sy);
+  drawExportPerimeters(tx);
+  drawNetworkCornerConnections(tx, 0);
+  tx.restore();
+
+  return tc;
+}
+
+/// PNG: 3840×2160 @ 150dpi, transparent background
+document.getElementById('exPng').addEventListener('click', () => {
+  const tc = renderPatternToCanvas(7680, 4320);
+  tc.toBlob(blob => {
+    blob.arrayBuffer().then(buf => {
+      const patched = injectPNGpHYs(buf, 150);
+      const url = URL.createObjectURL(new Blob([patched], { type: 'image/png' }));
+      const a = document.createElement('a'); a.download='pattern.png'; a.href=url; a.click();
+      URL.revokeObjectURL(url);
+      toast('Exported pattern.png (7680×4320 @ 150dpi, transparent)');
+    });
+  }, 'image/png');
+});
+
+// JPG: 3840×2160 @ 300dpi, with background
+document.getElementById('exJpg').addEventListener('click', () => {
+  const EW = 7680, EH = 4320;
+  const pattern = renderPatternToCanvas(EW, EH);
+  const tc = document.createElement('canvas'); tc.width=EW; tc.height=EH;
+  const tx = tc.getContext('2d');
+  tx.fillStyle = S.canvasBg; tx.fillRect(0, 0, EW, EH);
+  tx.drawImage(pattern, 0, 0);
+  tc.toBlob(blob => {
+    blob.arrayBuffer().then(buf => {
+      // Patch JFIF APP0 header to set 300dpi
+      // Structure: FF D8 | FF E0 | len(2) | "JFIF\0"(5) | ver(2) | units(1) | xdpi(2) | ydpi(2)
+      const arr = new Uint8Array(buf);
+      arr[13] = 1;          // units = DPI
+      arr[14] = 1; arr[15] = 0x2C; // X density = 300
+      arr[16] = 1; arr[17] = 0x2C; // Y density = 300
+      const url = URL.createObjectURL(new Blob([arr], { type: 'image/jpeg' }));
+      const a = document.createElement('a'); a.download='pattern.jpg'; a.href=url; a.click();
+      URL.revokeObjectURL(url);
+      toast('Exported pattern.jpg (7680×4320 @ 300dpi)');
+    });
+  }, 'image/jpeg', 0.95);
+});
 document.getElementById('exSvg').addEventListener('click', () => {
   const col = S.lineColor;
   let body = '';
@@ -2505,33 +2673,42 @@ document.getElementById('exSvg').addEventListener('click', () => {
   toast('Exported SVG');
 });
 
-document.getElementById('exVideo').addEventListener('click', async () => {
+document.getElementById('exVideo').addEventListener('click', () => {
   if (S.recording) return;
 
   const btn = document.getElementById('exVideo');
   const prog = document.getElementById('vp'), bar = document.getElementById('vpb');
 
-  // ── Animated GIF export ─────────────────────────────────────────────────────
-  // One perfectly-seamless loop at 1920×1080 with solid background.
-  // Duration = one full spatial sine cycle (starts and ends at same drift = 0).
-  // Uses gifenc (MIT, ~12 KB) loaded via fetch→blob so it works from file://,
-  // GitHub Pages, or any HTTPS host without import() cross-origin restrictions.
+  // ── MP4 / H.264 export via MediaRecorder (no external deps) ─────────────────
+  // Renders one full seamless loop frame-by-frame to an off-screen canvas,
+  // captured as H.264 MP4 via MediaRecorder (native in Chrome/Safari on macOS).
 
-  const GIF_FPS    = 25;
-  const GIF_FRAMES = 120;                    // 4.8 s loop at 25 fps
-  const GIF_DELAY  = 4;                      // 4cs = 40ms — well above browser minimum, universally honoured
-  const SPATIAL_STEP = (2 * Math.PI) / GIF_FRAMES;   // exactly one sine cycle
+  const FPS    = 30;
+  const FRAMES = 150;   // 5-second loop at 30fps
+  const SPATIAL_STEP = (2 * Math.PI) / FRAMES;
   const sm = 0.5 + S.speed * 3;
   const saved = paths.map(p => p.off);
 
-  // Pre-compute a perfectly-looping step per path.
   paths.forEach(p => {
-    const adv = GIF_FRAMES * p.sp * sm * 0.4, loops = Math.round(adv / UNIT) || 1;
-    p._ls = (loops * UNIT) / (GIF_FRAMES * sm * 0.4); p._s0 = 0; p.off = 0;
+    const adv = FRAMES * p.sp * sm * 0.4, loops = Math.round(adv / UNIT) || 1;
+    p._ls = (loops * UNIT) / (FRAMES * sm * 0.4); p._s0 = 0; p.off = 0;
   });
 
+  // Pick best supported H.264 MP4 mime type
+  const mp4Types = [
+    'video/mp4; codecs="avc1.42E01E"',
+    'video/mp4; codecs="avc1"',
+    'video/mp4; codecs="h264"',
+    'video/mp4',
+  ];
+  const mimeType = mp4Types.find(t => MediaRecorder.isTypeSupported(t));
+  if (!mimeType) {
+    toast('H.264 MP4 not supported in this browser — try Chrome or Safari');
+    return;
+  }
+
   S.recording = true; btn.classList.add('is-recording');
-  btn.textContent = '● Loading…';
+  btn.textContent = '● Recording…';
   prog.style.display = 'block'; bar.style.width = '0%';
   cancelAnimationFrame(animId);
 
@@ -2543,90 +2720,78 @@ document.getElementById('exVideo').addEventListener('click', async () => {
     (function loop() { draw(); animId = requestAnimationFrame(loop); })();
   }
 
-  // Draw one frame to any 2D context at the target resolution.
-  // Includes spatial drift. No cursor deformation (clean export).
-  function drawGifFrame(ctx, tw, th, drift) {
-    ctx.fillStyle = S.canvasBg;
-    ctx.fillRect(0, 0, tw, th);
-    ctx.save();
-    ctx.scale(tw / W, th / H);
-    ctx.save();
-    ctx.translate(drift, 0);
-    for (const p of paths) {
-      const subs = deformPath(p, drift);
-      for (const flat_r of subs) {
-        drawUnits(ctx, flat_r, p.off, S.lineColor);
+  const EW = 1920, EH = 1080;
+  const oc = document.createElement('canvas'); oc.width = EW; oc.height = EH;
+  const octx = oc.getContext('2d');
+
+  function drawVideoFrame(drift) {
+    const sx = EW / W, sy = EH / H;
+
+    // Phase 1: Fill background + draw pattern paths
+    octx.fillStyle = S.canvasBg;
+    octx.fillRect(0, 0, EW, EH);
+    octx.save();
+    octx.scale(sx, sy);
+    octx.save();
+    octx.translate(drift, 0);
+    drawExportPaths(octx, drift);
+    octx.restore();   // remove drift
+    octx.restore();   // remove scale
+
+    // Phase 2: Punch void with background color
+    if (S.shapes.length > 0 && (S.pattern === 'city' || S.pattern === 'networks')) {
+      octx.fillStyle = S.canvasBg;
+      for (const sh of S.shapes) {
+        octx.fillRect(sh.x * sx, sh.y * sy, sh.w * sx, sh.h * sy);
       }
     }
-    if (S.pattern === 'networks' && S.networkNodes) {
-      ctx.fillStyle = S.lineColor;
-      for (const n of S.networkNodes) {
-        const d = repulse(n.x, n.y, drift);
-        ctx.beginPath(); ctx.arc(n.x + d.ox, n.y + d.oy, CR, 0, Math.PI * 2); ctx.fill();
-      }
-    }
-    ctx.restore(); // inner (drift)
-    ctx.restore(); // outer (scale)
+
+    // Phase 3: Draw perimeters + connections ON TOP of void (screen-fixed, scaled)
+    octx.save();
+    octx.scale(sx, sy);
+    drawExportPerimeters(octx);
+    drawNetworkCornerConnections(octx, drift);
+    octx.restore();
   }
 
-  try {
-    // Load gifenc via fetch → same-origin blob URL.
-    // This pattern works from file://, GitHub Pages, and any HTTPS host.
-    const code = await fetch(
-      'https://cdn.jsdelivr.net/npm/gifenc@1.0.3/dist/gifenc.esm.js'
-    ).then(r => {
-      if (!r.ok) throw new Error(`CDN error ${r.status} — check internet connection`);
-      return r.text();
-    });
-    const blobUrl = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
-    const { GIFEncoder, quantize, applyPalette } = await import(blobUrl);
-    URL.revokeObjectURL(blobUrl);
+  const stream = oc.captureStream(FPS);
+  const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 8_000_000 });
+  const chunks = [];
 
-    btn.textContent = '● Encoding GIF…';
-
-    const EW = 960, EH = 540;   // half-res: 4× fewer pixels → smooth 25 fps in all viewers/apps
-    const oc = document.createElement('canvas'); oc.width = EW; oc.height = EH;
-    const octx = oc.getContext('2d');
-
-    const gif = GIFEncoder();
-    let palette = null;
-
-    for (let f = 0; f < GIF_FRAMES; f++) {
-      // Advance line offsets for this frame
-      paths.forEach(p => { p.off = p._s0 + f * (p._ls || p.sp) * sm * 0.4; });
-
-      // Spatial drift: one full sine cycle across all frames → perfect seamless loop
-      const drift = S.movement === 'spatial' ? Math.sin(f * SPATIAL_STEP) * 120 : 0;
-      drawGifFrame(octx, EW, EH, drift);
-
-      // Read pixels; build palette from first frame, reuse for all (consistent colours)
-      const { data } = octx.getImageData(0, 0, EW, EH);
-      if (!palette) palette = quantize(data, 16);
-      const index = applyPalette(data, palette);
-
-      gif.writeFrame(index, EW, EH, {
-        palette,
-        delay: GIF_DELAY,
-        ...(f === 0 ? { repeat: 0 } : {})  // Netscape loop extension on first frame only
-      });
-
-      bar.style.width = ((f + 1) / GIF_FRAMES * 100) + '%';
-      if (f % 6 === 0) await new Promise(r => setTimeout(r, 0)); // keep UI responsive
-    }
-
-    gif.finish();
-    const blob = new Blob([gif.bytes()], { type: 'image/gif' });
+  recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+  recorder.onstop = () => {
+    const blob = new Blob(chunks, { type: 'video/mp4' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.download = 'pattern-loop.gif'; a.href = url; a.click();
+    const a = document.createElement('a'); a.download = 'pattern-loop.mp4'; a.href = url; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
-    toast('Exported GIF — 960×540 HD, seamless loop');
+    toast('Exported pattern-loop.mp4 (1920×1080 H.264, 5s)');
+    cleanup();
+  };
 
-  } catch (e) {
-    console.error('GIF export error:', e);
-    toast('GIF export failed: ' + (e.message || e));
+  recorder.start(100);  // collect data in 100ms chunks
+
+  let f = 0;
+  const MS_PER_FRAME = 1000 / FPS;
+  let lastFrameTime = null;
+
+  function renderNext(now) {
+    if (lastFrameTime === null) lastFrameTime = now;
+    if (now - lastFrameTime >= MS_PER_FRAME - 1) {
+      lastFrameTime += MS_PER_FRAME;  // advance by fixed step to avoid drift
+      paths.forEach(p => { p.off = p._s0 + f * (p._ls || p.sp) * sm * 0.4; });
+      const drift = S.movement === 'spatial' ? Math.sin(f * SPATIAL_STEP) * 120 : 0;
+      drawVideoFrame(drift);
+      bar.style.width = ((f + 1) / FRAMES * 100) + '%';
+      f++;
+      if (f >= FRAMES) {
+        setTimeout(() => recorder.stop(), 300);
+        return;
+      }
+    }
+    requestAnimationFrame(renderNext);
   }
 
-  cleanup();
+  requestAnimationFrame(renderNext);
 });
 
 // ================================================================
