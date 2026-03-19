@@ -87,8 +87,12 @@
           <button id="mMotion" class="btn is-active">Animate Lines</button>
         </div>
         <div class="controls-row cols-2">
-          <button id="mFixed"   class="btn is-active">Fixed</button>
-          <button id="mSpatial" class="btn">Spatial</button>
+          <button id="mFixed"    class="btn is-active">Fixed</button>
+          <button id="mSpatial"  class="btn">Spatial 1</button>
+        </div>
+        <div class="controls-row cols-2">
+          <button id="mSpatial2" class="btn">Spatial 2</button>
+          <button id="mSpatial3" class="btn">Spatial 3</button>
         </div>
       </div>
     </section>
@@ -216,10 +220,13 @@
     <section class="info-section">
       <h3>Motion</h3>
       <ul>
-        <li><strong>Interactive</strong> — Place rectangles on the canvas to create open areas in the pattern for content or images to be placed after exporting.</li>
+        <li><strong>Interactive</strong> — Place rectangles on the canvas to create open areas in the pattern for content or images.</li>
         <li><strong>Passive</strong> — The pattern animates on its own.</li>
         <li><strong>Animate Lines</strong> — Turn line movement on or off.</li>
-        <li><strong>Fixed / Spatial</strong> — Keep the pattern still or add a slow drifting motion.</li>
+        <li><strong>Fixed</strong> — Pattern stays in place.</li>
+        <li><strong>Spatial 1</strong> — Slow horizontal drift, looping smoothly left and right.</li>
+        <li><strong>Spatial 2</strong> — Figure-eight drift, moving in both horizontal and vertical axes.</li>
+        <li><strong>Spatial 3</strong> — The pattern wraps around a rotating globe. Passive mode only.</li>
       </ul>
     </section>
 
@@ -243,8 +250,12 @@
       <ul>
         <li><strong>PNG / JPG</strong> — Save a still image.</li>
         <li><strong>SVG</strong> — Export a scalable file.</li>
-        <li><strong>Animation</strong> — Record a 10-second loop.</li>
+        <li><strong>Animation</strong> — Record a looping video. Duration matches the natural cycle of each spatial mode.</li>
       </ul>
+    </section>
+
+    <section class="info-section">
+      <p style="opacity:0.45;font-size:0.75rem;margin-top:8px;">Version: 2.1</p>
     </section>
 
   </div>

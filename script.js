@@ -4,8 +4,8 @@
 const S = {
   pattern: 'terrain', theme: 'light',
   inverted: false,
-  motionOn: true, mode: 'active',
-  movement: 'fixed', spatialX: 0,
+  motionOn: true, mode: 'passive',
+  movement: 'fixed', spatialX: 0, driftY: 0,
   speed: 0.5, density: 0.5, seed: 5,
   lineColor: '#FFFFFF', canvasBg: '#DFDFDF',
   shapes: [],
@@ -165,6 +165,49 @@ const GEO = {
 
     // Normalize to [-1, 1] range
     return maxAmplitude > 0 ? result / maxAmplitude : 0;
+  },
+
+  // ── Tileable noise: lattice wraps at exact canvas boundaries ──────────────
+  // perlinNoiseTileable(x, y, pW, pH, seed):
+  //   Identical gradient noise to perlinNoise, but the gradient lattice
+  //   wraps at integer period pW (x) and pH (y) so the field is periodic:
+  //   f(x,y) = f(x+pW, y) = f(x, y+pH).  Both pW and pH must be ≤ 255.
+  perlinNoiseTileable: function(x, y, pW, pH, seed) {
+    const perm  = this._permute(seed);
+    const grads = this._gradients;
+    const fade  = t => t * t * t * (t * (t * 6 - 15) + 10);
+    const lerp  = (t, a, b) => a + t * (b - a);
+    const xi = Math.floor(x) | 0,  yi = Math.floor(y) | 0;
+    const xf = x - xi,              yf = y - yi;
+    const xi0 = ((xi % pW) + pW) % pW,  xi1 = (xi0 + 1) % pW;
+    const yi0 = ((yi % pH) + pH) % pH,  yi1 = (yi0 + 1) % pH;
+    const gi00 = perm[(perm[xi0 & 255] + yi0) & 255] & 15;
+    const gi10 = perm[(perm[xi1 & 255] + yi0) & 255] & 15;
+    const gi01 = perm[(perm[xi0 & 255] + yi1) & 255] & 15;
+    const gi11 = perm[(perm[xi1 & 255] + yi1) & 255] & 15;
+    const g00  = grads[gi00].x * xf        + grads[gi00].y * yf;
+    const g10  = grads[gi10].x * (xf - 1)  + grads[gi10].y * yf;
+    const g01  = grads[gi01].x * xf        + grads[gi01].y * (yf - 1);
+    const g11  = grads[gi11].x * (xf - 1)  + grads[gi11].y * (yf - 1);
+    const u = fade(xf), v = fade(yf);
+    return Math.max(-0.95, Math.min(0.95, lerp(v, lerp(u, g00, g10), lerp(u, g01, g11)))) / 0.95;
+  },
+
+  // fBmTileable(px, py, Wp, Hp, seed, octaves, persistence, lacunarity):
+  //   Fractal Brownian Motion that tiles seamlessly at canvas dimensions Wp × Hp.
+  //   CELLS = 2 base cells per dimension gives large-scale character matching
+  //   the existing terrain while guaranteeing zero seam at canvas boundaries.
+  fBmTileable: function(px, py, Wp, Hp, seed, octaves = 3, persistence = 0.5, lacunarity = 2.0) {
+    const CELLS = 2;  // 2 primary undulations per canvas width — preserves existing scale
+    let amp = 1, freq = 1, val = 0, maxAmp = 0;
+    for (let i = 0; i < octaves; i++) {
+      const c = Math.round(CELLS * freq);  // integer cell count — period stays exact
+      val   += amp * this.perlinNoiseTileable(px * c / Wp, py * c / Hp, c, c, seed + i * 1000);
+      maxAmp += amp;
+      amp   *= persistence;
+      freq  *= lacunarity;
+    }
+    return maxAmp > 0 ? val / maxAmp : 0;
   },
 
   /**
@@ -848,23 +891,27 @@ function buildTerrain(r, n) {
   const persistence = 0.5 + r() * 0.2;  // Vary amplitude falloff per seed
   const lacunarity = 1.8 + r() * 0.4;   // Vary frequency scaling
 
-  // Height function: fBm + tilt for directional variation
+  // Height function: seamlessly tileable via cross-fade blend.
+  // Evaluates the original fBm at four periodic neighbours and blends with smoothstep
+  // weights so the field is identical at x=0/x=W and y=0/y=H — zero seam for sphere
+  // wrapping and tiled exports. Density is unchanged from the original.
   function hAt(x, y) {
-    const nx = x / Math.max(W, H);
-    const ny = y / Math.max(W, H);
+    const mx = ((x % W) + W) % W;
+    const my = ((y % H) + H) % H;
+    const ax = (u => u * u * (3 - 2 * u))(mx / W);  // smoothstep → 0 at edges
+    const ay = (u => u * u * (3 - 2 * u))(my / H);
 
-    // Core fBm: creates nested contour hierarchy with natural spacing
-    let v = GEO.fBm(nx * 100, ny * 100, seed, octaves, persistence, lacunarity);
+    function base(rx, ry) {
+      const nx = rx / Math.max(W, H), ny = ry / Math.max(W, H);
+      let v = GEO.fBm(nx * 100, ny * 100, seed, octaves, persistence, lacunarity);
+      v = v * 0.8 + 0.3 * Math.sin(nx * Math.PI * 2) * Math.cos(ny * Math.PI * 2) * 0.2;
+      return v + tiltX * (nx - 0.5) + tiltY * (ny - 0.5);
+    }
 
-    // Optional amplitude modulation: subtle peaks to add visual interest
-    // This replaces the Gaussian features with a more cohesive approach
-    const modulation = 0.3 * Math.sin(nx * Math.PI * 2) * Math.cos(ny * Math.PI * 2);
-    v = v * 0.8 + modulation * 0.2;
-
-    // Global tilt: creates directional flow across terrain
-    v += tiltX * (nx - 0.5) + tiltY * (ny - 0.5);
-
-    return v;
+    return base(mx,     my    ) * (1 - ax) * (1 - ay)
+         + base(mx - W, my    ) * ax       * (1 - ay)
+         + base(mx,     my - H) * (1 - ax) * ay
+         + base(mx - W, my - H) * ax       * ay;
   }
 
   // ── 2. Sample grid at resolution tuned for fBm complexity ─────
@@ -1192,9 +1239,14 @@ function buildCity(r, n) {
 
   const bleed = Math.max(cellSize * 2, 200);  // Always at least 200 px for spatial drift
   const gridCols = Math.max(3, Math.ceil((W + bleed * 2) / cellSize) + 1);
-  const gridRows = Math.max(3, Math.ceil((H + bleed * 2) / cellSize) + 1);
+
+  // Y-axis: snap cell height so grid divides evenly into canvas height → seamless top/bottom tiling
+  const snapRows  = Math.max(1, Math.round(H / cellSize));
+  const cellSizeY = H / snapRows;
+  const gridRows  = Math.max(3, Math.ceil((H + bleed * 2) / cellSizeY) + 1);
+
   const gridStartX = -bleed;
-  const gridStartY = -bleed;
+  const gridStartY = -Math.ceil(bleed / cellSizeY) * cellSizeY;
 
   // --- Diagonal road corridors ---
   // Each corridor has a width and two parallel edges.
@@ -1240,24 +1292,6 @@ function buildCity(r, n) {
     });
   }
 
-  // Sutherland-Hodgman clip polygon against a half-plane (keep side where signed dist > threshold)
-  function clipPolyHalfPlane(pts, cx, cy, nx, ny, threshold) {
-    if (pts.length === 0) return [];
-    const out = [];
-    for (let i = 0; i < pts.length; i++) {
-      const a = pts[i];
-      const b = pts[(i + 1) % pts.length];
-      const da = (a.x - cx) * nx + (a.y - cy) * ny - threshold;
-      const db = (b.x - cx) * nx + (b.y - cy) * ny - threshold;
-      if (da >= 0) out.push(a);
-      if ((da > 0 && db < 0) || (da < 0 && db > 0)) {
-        const t = da / (da - db);
-        out.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
-      }
-    }
-    return out;
-  }
-
   // Clip a polygon against a corridor — keep parts OUTSIDE (left + right sides)
   function clipByCorridors(pts) {
     if (corridors.length === 0) return [pts];
@@ -1268,9 +1302,9 @@ function buildCity(r, n) {
       for (const poly of current) {
         // Left side: perpDist < -halfW  → clip to dist < -halfW
         //   means: keep where -(px,py) dot > halfW → flip normal
-        const leftSide = clipPolyHalfPlane(poly, c.cx, c.cy, -c.px, -c.py, c.halfW);
+        const leftSide = clipPolyHP(poly, c.cx, c.cy, -c.px, -c.py, c.halfW);
         // Right side: perpDist > +halfW → keep where (px,py) dot > halfW
-        const rightSide = clipPolyHalfPlane(poly, c.cx, c.cy, c.px, c.py, c.halfW);
+        const rightSide = clipPolyHP(poly, c.cx, c.cy, c.px, c.py, c.halfW);
         if (leftSide.length > 2)  next.push(leftSide);
         if (rightSide.length > 2) next.push(rightSide);
       }
@@ -1298,9 +1332,9 @@ function buildCity(r, n) {
 
       // Pixel rect — formula guarantees exactly roadWidth gap on every side
       const x0 = gridStartX + col * cellSize;
-      const y0 = gridStartY + row * cellSize;
-      const x1 = x0 + bw * cellSize - roadWidth;
-      const y1 = y0 + bh * cellSize - roadWidth;
+      const y0 = gridStartY + row * cellSizeY;
+      const x1 = x0 + bw * cellSize  - roadWidth;
+      const y1 = y0 + bh * cellSizeY - roadWidth;
 
       // Mark cells as occupied
       for (let dc = 0; dc < bw; dc++)
@@ -1370,10 +1404,12 @@ function buildNetworks(r, n) {
   const areaH = H + bleed * 2;
 
   // Convert screen-space shapes to world-space for node/edge rejection
-  const curDrift = S.movement === 'spatial' ? Math.sin(S.spatialX) * 120 : 0;
+  const curDriftX = S.movement === 'spatial'  ? Math.sin(S.spatialX) * 120
+                  : S.movement === 'spatial2' ? Math.sin(S.spatialX) * 85 : 0;
+  const curDriftY = S.movement === 'spatial2' ? Math.sin(S.spatialX * 2) * 50 : 0;
   const savedShapes = S.shapes;
-  if (curDrift !== 0) {
-    S.shapes = S.shapes.map(sh => ({ x: sh.x - curDrift, y: sh.y, w: sh.w, h: sh.h }));
+  if (curDriftX !== 0 || curDriftY !== 0) {
+    S.shapes = S.shapes.map(sh => ({ x: sh.x - curDriftX, y: sh.y - curDriftY, w: sh.w, h: sh.h }));
   }
 
   // Poisson-disk scatter filling canvas + bleed area
@@ -1392,10 +1428,31 @@ function buildNetworks(r, n) {
     attempts++;
   }
 
-  // Full Delaunay triangulation — all edges, straight lines
-  const delaunayEdges = GEO.delaunayTriangulate(nodes);
+  // ── Ghost nodes for seamless X-seam (sphere wrapping + tiling) ──────────
+  // Nodes near the left/right canvas edges are mirrored on the opposite side
+  // so Delaunay naturally produces edges that cross the seam boundary.
+  // In sphere mode these project correctly onto the sphere surface.
+  // In flat modes the off-canvas portions are simply clipped — no visual change.
+  const GHOST_PAD = bleed * 1.1;
+  const ghosts = [];
+  for (const n of nodes) {
+    // Edge ghosts — connect left↔right and top↔bottom seams
+    if (n.x < GHOST_PAD)               ghosts.push({ x: n.x + W, y: n.y,     src: n });
+    if (n.x > W - GHOST_PAD)           ghosts.push({ x: n.x - W, y: n.y,     src: n });
+    if (n.y < GHOST_PAD)               ghosts.push({ x: n.x,     y: n.y + H, src: n });
+    if (n.y > H - GHOST_PAD)           ghosts.push({ x: n.x,     y: n.y - H, src: n });
+    // Corner ghosts — fill the 4 diagonal seam intersections
+    if (n.x < GHOST_PAD && n.y < GHOST_PAD)           ghosts.push({ x: n.x + W, y: n.y + H, src: n });
+    if (n.x < GHOST_PAD && n.y > H - GHOST_PAD)       ghosts.push({ x: n.x + W, y: n.y - H, src: n });
+    if (n.x > W - GHOST_PAD && n.y < GHOST_PAD)       ghosts.push({ x: n.x - W, y: n.y + H, src: n });
+    if (n.x > W - GHOST_PAD && n.y > H - GHOST_PAD)   ghosts.push({ x: n.x - W, y: n.y - H, src: n });
+  }
+
+  // Full Delaunay triangulation including ghost nodes for seam-crossing edges
+  const delaunayEdges = GEO.delaunayTriangulate([...nodes, ...ghosts]);
 
   for (const [p0, p1] of delaunayEdges) {
+    if (p0.src && p1.src) continue;  // both ghosts — not a useful edge
     // Skip edges that pass through a shape rectangle
     if (S.shapes.length > 0 && segCrossesAnyShape(p0, p1)) continue;
     // Store structural endpoints — interpolation happens at draw time
@@ -1908,18 +1965,13 @@ function drawUnits(ctx, flat, off, color) {
 /**
  * Deform/split a path for rectangle interaction. Different per pattern:
  *
- * TERRAIN: Split path at rectangle boundaries → clean rectangular void.
- *   Uses splitPathAtShapes for precise geometric cutting. Returns array of
- *   sub-path flattenings that get drawn independently.
+ * TERRAIN: Split path at rectangle boundaries using splitPathAtShapes.
+ *   Returns array of sub-path flattenings drawn independently.
  *
- * PATHWAYS: Per-point SDF repulsion. Each individual point near the rectangle
- *   gets pushed outward so the path curves/wraps around the obstacle. The path
- *   stays in its general position but locally deforms.
+ * CITY / NETWORKS (rigid paths): No deformation — block re-clipping and
+ *   canvas void punch are handled separately in the draw and export loops.
  *
- * CITY: Centroid-based uniform translation (keeps rectangles axis-aligned).
- *   Blocks stay horizontal/vertical. Road spacing is preserved.
- *
- * NETWORKS: Endpoint-only repulsion with straight re-interpolation.
+ * PATHWAYS / DEFAULT: Returns the flat path unchanged.
  */
 function deformPath(p, drift) {
   // ── CITY / NETWORKS: no deformation — clip + rebuild handles the void ──
@@ -1933,7 +1985,7 @@ function deformPath(p, drift) {
   // provides a safety net for any edge artifacts.
   if (S.pattern === 'terrain' && S.shapes.length > 0) {
     const savedShapes = S.shapes;
-    S.shapes = S.shapes.map(sh => ({ x: sh.x - drift, y: sh.y, w: sh.w, h: sh.h }));
+    S.shapes = S.shapes.map(sh => ({ x: sh.x - drift, y: sh.y - S.driftY, w: sh.w, h: sh.h }));
     const subPaths = splitPathAtShapes(p.pts, 4);
     S.shapes = savedShapes;
     if (subPaths.length === 0) return [];
@@ -1950,7 +2002,32 @@ function deformPath(p, drift) {
  * Main render loop: animate and draw all pattern paths
  * Handles path flattening with interaction deformation
  */
-function draw() {
+// ── Sphere projection for Spatial 4 ──────────────────────────────────────────
+// Maps a flat canvas point (x, y) onto a rotating globe using equirectangular
+// projection and orthographic camera along the +X axis.
+// Returns {x, y} screen position, or null if the point is on the back hemisphere.
+function sphereProject(x, y, rotAngle) {
+  const scx = W * 0.5, scy = H * 0.5;
+  const SR  = Math.min(W, H) * 0.44;
+  // Flat coords → equirectangular spherical angles
+  const lon = (x / W - 0.5) * 2 * Math.PI;       // longitude [-π, π]
+  const lat = (0.5 - y / H) * Math.PI * 0.78;    // latitude  [±70°] — avoids polar convergence jumble
+  // Spherical → unit-sphere Cartesian
+  const cosLat = Math.cos(lat);
+  const x3 = cosLat * Math.cos(lon);
+  const y3 = cosLat * Math.sin(lon);
+  const z3 = Math.sin(lat);
+  // Rotate globe around polar (Z) axis
+  const cos_r = Math.cos(rotAngle), sin_r = Math.sin(rotAngle);
+  const xr = x3 * cos_r - y3 * sin_r;
+  const yr = x3 * sin_r + y3 * cos_r;
+  const zr = z3;
+  // Orthographic projection — camera at +X; only front hemisphere visible
+  if (xr <= 0.01) return null;
+  return { x: scx + yr * SR, y: scy - zr * SR };
+}
+
+function draw(ts = performance.now()) {
   // ── Advance dash offsets once per frame ──────────────────────────
   const sm = S.motionOn ? 0.5 + S.speed * 3 : 0;
   for (const p of paths) {
@@ -1958,18 +2035,32 @@ function draw() {
   }
 
   // ── Spatial drift: sine-wave oscillation within the bleed zone ───
-  // All patterns extend 200 px beyond every canvas edge, so a ±120 px
-  // horizontal sine drift never exposes an empty border — zero seam,
-  // truly infinite, no tiling required.
-  if (S.movement === 'spatial') S.spatialX += 0.004;
-  const drift = S.movement === 'spatial' ? Math.sin(S.spatialX) * 120 : 0;
+  // Spatial 1: horizontal only (±120px X)
+  // Spatial 2: figure-8 Lissajous (±85px X, ±50px Y at double-freq) — gentle organic undulation
+  // Spatial 3: sphere globe projection — full rotation every 10s, passive mode only
+  const isSpatial = S.movement === 'spatial'  || S.movement === 'spatial2'
+                 || S.movement === 'spatial3';
+  // Delta-time advancement: spatialX advances at fixed rad/s regardless of display Hz.
+  // Spatial 1 & 2: 2π/10s (one drift cycle = 10s). Spatial 3: 2π/30s (one globe rotation = 30s).
+  const dt = Math.min((ts - lastDrawTime) / 1000, 0.1);  // seconds, capped to avoid jumps
+  lastDrawTime = ts;
+  if (isSpatial) {
+    const radPerSec = S.movement === 'spatial3' ? (2 * Math.PI / 30) : (2 * Math.PI / 10);
+    S.spatialX += radPerSec * dt;
+  }
+  const drift  = S.movement === 'spatial'  ? Math.sin(S.spatialX) * 120
+               : S.movement === 'spatial2' ? Math.sin(S.spatialX) * 85
+               : 0;  // spatial3 uses sphere projection, no translation
+  const driftY = S.movement === 'spatial2' ? Math.sin(S.spatialX * 2) * 50
+               : 0;
+  S.driftY = driftY;
 
   // Networks in spatial mode: rebuild periodically so edge clipping
   // stays aligned with the drifting rectangle position.
-  if (S.movement === 'spatial' && S.shapes.length > 0 && S.pattern === 'networks') {
-    if (draw._lastDrift === undefined) draw._lastDrift = drift;
-    if (Math.abs(drift - draw._lastDrift) > 8) {
-      draw._lastDrift = drift;
+  if (isSpatial && S.shapes.length > 0 && S.pattern === 'networks') {
+    if (draw._lastDrift === undefined) { draw._lastDrift = drift; draw._lastDriftY = driftY; }
+    if (Math.abs(drift - draw._lastDrift) > 8 || Math.abs(driftY - draw._lastDriftY) > 8) {
+      draw._lastDrift = drift; draw._lastDriftY = driftY;
       rebuild();
     }
   }
@@ -1979,91 +2070,129 @@ function draw() {
   cx.fillStyle = S.canvasBg;
   cx.fillRect(0, 0, W, H);
 
-  // ── Draw paths + nodes, shifted by spatial drift ─────────────────
-  cx.save();
-  cx.translate(drift, 0);
+  // ── Draw paths + nodes ────────────────────────────────────────────
+  if (S.movement === 'spatial3') {
+    // ── Spatial 3: sphere globe projection ───────────────────────────
+    // Pattern wraps around a rotating sphere. Each point is mapped through
+    // equirectangular → 3D sphere → orthographic projection to the screen.
+    // Points on the back hemisphere are invisible (path segment clipped).
+    const s4rot = S.spatialX;  // one full rotation per 10s cycle
+    const SR = Math.min(W, H) * 0.44;
 
-  // Clip a screen-fixed rectangular void so the gap stays anchored to the
-  // rectangle even when patterns drift in spatial mode.
-  if (S.shapes.length > 0 && (S.pattern === 'city' || S.pattern === 'networks' || S.pattern === 'terrain')) {
-    const CBLEED = 400;
+    // Clip all drawing to the sphere circle
+    cx.save();
     cx.beginPath();
-    cx.rect(-CBLEED - Math.abs(drift), -CBLEED,
-            W + CBLEED * 2 + Math.abs(drift) * 2, H + CBLEED * 2);
-    for (const sh of S.shapes) {
-      cx.rect(sh.x - drift, sh.y, sh.w, sh.h);
-    }
-    cx.clip('evenodd');
-  }
+    cx.arc(W * 0.5, H * 0.5, SR, 0, Math.PI * 2);
+    cx.clip();
 
-  for (const p of paths) {
-    // Skip screen-fixed paths here — drawn outside drift translate below
-    if (p.screenFixed) continue;
-
-    // City blocks in spatial mode: re-clip blockPoly against shapes every frame
-    // so block edges track the rectangle smoothly as the pattern drifts.
-    if (p.blockPoly && S.shapes.length > 0) {
-      const halfRd = p.blockRoadW * 0.5;
-      const MIN_BLK = p.blockRoadW * 0.8;
-      let fragments = [p.blockPoly];
-      for (const sh of S.shapes) {
-        // Shape is screen-fixed; convert to world-space by subtracting drift
-        const rx = sh.x - drift - halfRd, ry = sh.y - halfRd;
-        const rw = sh.w + p.blockRoadW, rh = sh.h + p.blockRoadW;
-        const next = [];
-        for (const poly of fragments) {
-          const clipped = clipPolyByRect(poly, rx, ry, rw, rh);
-          for (const frag of clipped) next.push(frag);
-        }
-        fragments = next;
-      }
-      // Draw each surviving fragment
-      for (const frag of fragments) {
-        let fMinX = Infinity, fMaxX = -Infinity, fMinY = Infinity, fMaxY = -Infinity;
-        for (const pt of frag) {
-          if (pt.x < fMinX) fMinX = pt.x; if (pt.x > fMaxX) fMaxX = pt.x;
-          if (pt.y < fMinY) fMinY = pt.y; if (pt.y > fMaxY) fMaxY = pt.y;
-        }
-        if (fMaxX - fMinX < MIN_BLK || fMaxY - fMinY < MIN_BLK) continue;
-        const ring = [...frag, frag[0]];
-        const fragPts = [];
-        for (let i = 0; i < ring.length - 1; i++) {
-          const a = ring[i], b = ring[i + 1];
-          const ex = b.x - a.x, ey = b.y - a.y;
-          const steps = Math.ceil(Math.hypot(ex, ey) / 8);
-          for (let j = 0; j < steps; j++) {
-            const t = j / steps;
-            fragPts.push({ x: a.x + ex * t, y: a.y + ey * t });
-          }
-        }
-        fragPts.push(fragPts[0]);
-        if (fragPts.length > 4) {
-          drawUnits(cx, flattenPath(fragPts), p.off, S.lineColor);
+    for (const p of paths) {
+      if (p.screenFixed) continue;
+      // Get dense path points — use pre-flattened if available, else flatten pts
+      const srcPts = p.flat ? p.flat : (p.pts && p.pts.length > 1 ? flattenPath(p.pts) : null);
+      if (!srcPts || srcPts.length < 2) continue;
+      // Project each point through sphere; split segments at hemisphere boundary
+      let seg = [];
+      for (const pt of srcPts) {
+        const pp = sphereProject(pt.x, pt.y, s4rot);
+        if (pp) {
+          seg.push(pp);
+        } else {
+          if (seg.length > 2) drawUnits(cx, flattenPath(seg), p.off, S.lineColor);
+          seg = [];
         }
       }
-      continue;
+      if (seg.length > 2) drawUnits(cx, flattenPath(seg), p.off, S.lineColor);
     }
 
-    if (p.flat) {
-      drawUnits(cx, p.flat, p.off, S.lineColor);
-    } else {
-      const subs = deformPath(p, drift);
-      for (const flat_r of subs) {
-        drawUnits(cx, flat_r, p.off, S.lineColor);
-      }
-    }
-  }
+    cx.restore();
 
-  if (S.pattern === 'networks' && S.networkNodes) {
-    cx.fillStyle = S.lineColor;
-    for (const n of S.networkNodes) {
+  } else {
+    // ── All other modes: translate + draw ────────────────────────────
+    cx.save();
+    cx.translate(drift, driftY);
+
+    // Clip a screen-fixed rectangular void so the gap stays anchored to the
+    // rectangle even when patterns drift in spatial mode.
+    if (S.shapes.length > 0 && (S.pattern === 'city' || S.pattern === 'networks' || S.pattern === 'terrain')) {
+      const CBLEED = 400;
       cx.beginPath();
-      cx.arc(n.x, n.y, CR, 0, Math.PI * 2);
-      cx.fill();
+      cx.rect(-CBLEED - Math.abs(drift), -CBLEED - Math.abs(driftY),
+              W + CBLEED * 2 + Math.abs(drift) * 2, H + CBLEED * 2 + Math.abs(driftY) * 2);
+      for (const sh of S.shapes) {
+        cx.rect(sh.x - drift, sh.y - driftY, sh.w, sh.h);
+      }
+      cx.clip('evenodd');
     }
+
+    for (const p of paths) {
+      if (p.screenFixed) continue;
+
+      // City blocks: re-clip blockPoly against shapes every frame
+      if (p.blockPoly && S.shapes.length > 0) {
+        const halfRd = p.blockRoadW * 0.5;
+        const MIN_BLK = p.blockRoadW * 0.8;
+        let fragments = [p.blockPoly];
+        for (const sh of S.shapes) {
+          const rx = sh.x - drift - halfRd, ry = sh.y - halfRd;
+          const rw = sh.w + p.blockRoadW, rh = sh.h + p.blockRoadW;
+          const next = [];
+          for (const poly of fragments) {
+            const clipped = clipPolyByRect(poly, rx, ry, rw, rh);
+            for (const frag of clipped) next.push(frag);
+          }
+          fragments = next;
+        }
+        for (const frag of fragments) {
+          let fMinX = Infinity, fMaxX = -Infinity, fMinY = Infinity, fMaxY = -Infinity;
+          for (const pt of frag) {
+            if (pt.x < fMinX) fMinX = pt.x; if (pt.x > fMaxX) fMaxX = pt.x;
+            if (pt.y < fMinY) fMinY = pt.y; if (pt.y > fMaxY) fMaxY = pt.y;
+          }
+          if (fMaxX - fMinX < MIN_BLK || fMaxY - fMinY < MIN_BLK) continue;
+          const ring = [...frag, frag[0]];
+          const fragPts = [];
+          for (let i = 0; i < ring.length - 1; i++) {
+            const a = ring[i], b = ring[i + 1];
+            const ex = b.x - a.x, ey = b.y - a.y;
+            const steps = Math.ceil(Math.hypot(ex, ey) / 8);
+            for (let j = 0; j < steps; j++) {
+              const t = j / steps;
+              fragPts.push({ x: a.x + ex * t, y: a.y + ey * t });
+            }
+          }
+          fragPts.push(fragPts[0]);
+          if (fragPts.length > 4) drawUnits(cx, flattenPath(fragPts), p.off, S.lineColor);
+        }
+        continue;
+      }
+
+      if (p.flat) {
+        drawUnits(cx, p.flat, p.off, S.lineColor);
+      } else {
+        const subs = deformPath(p, drift);
+        for (const flat_r of subs) drawUnits(cx, flat_r, p.off, S.lineColor);
+      }
+    }
+
+    if (S.pattern === 'networks' && S.networkNodes) {
+      cx.fillStyle = S.lineColor;
+      for (const n of S.networkNodes) {
+        cx.beginPath();
+        cx.arc(n.x, n.y, CR, 0, Math.PI * 2);
+        cx.fill();
+      }
+    }
+
+    cx.restore();
   }
 
-  cx.restore();
+  // Fill rectangle voids before drawing perimeter lines so the fill sits behind them
+  if (S.shapes.length > 0) {
+    for (const sh of S.shapes) {
+      cx.fillStyle = S.canvasBg;
+      cx.fillRect(sh.x, sh.y, sh.w, sh.h);
+    }
+  }
 
   // ── Screen-fixed paths (e.g. network rectangle perimeter) ──────────
   for (const p of paths) {
@@ -2086,13 +2215,12 @@ function draw() {
         // Find nearest node in screen space
         let bestD = Infinity, bestN = null;
         for (const n of S.networkNodes) {
-          const screenX = n.x + drift;
-          const d = Math.hypot(c.x - screenX, c.y - n.y);
+          const d = Math.hypot(c.x - (n.x + drift), c.y - (n.y + driftY));
           if (d < bestD) { bestD = d; bestN = n; }
         }
         if (bestN && bestD < 600) {
           // Draw connection line from corner (screen) to node (screen)
-          const nx = bestN.x + drift, ny = bestN.y;
+          const nx = bestN.x + drift, ny = bestN.y + driftY;
           const dx = nx - c.x, dy = ny - c.y;
           const steps = Math.max(1, Math.ceil(Math.hypot(dx, dy) / 6));
           const pts = [];
@@ -2134,7 +2262,8 @@ function draw() {
 }
 
 let animId;
-(function loop() { draw(); animId = requestAnimationFrame(loop); })();
+let lastDrawTime = 0;
+(function loop(ts) { lastDrawTime = lastDrawTime || ts; draw(ts); animId = requestAnimationFrame(loop); })(performance.now());
 
 // ================================================================
 // CANVAS INTERACTION
@@ -2212,7 +2341,6 @@ cv.addEventListener('mouseup', () => {
     clearTimeout(rebuildTimer);
     rebuild(); // Bake final rect position into city/network geometry
   }
-  shapeDrag = null;
 });
 
 document.getElementById('addRectBtn').addEventListener('click', () => {
@@ -2372,17 +2500,39 @@ function exclusive(aId, bId, onA, onB) {
 }
 
 exclusive('mActive','mPassive',
-  () => { S.mode='active';  stage.classList.add('active-mode');    document.getElementById('shape-toolbar').classList.add('visible'); },
+  () => {
+    // Spatial 3 (sphere) is passive-only — block switching to interactive
+    if (S.movement === 'spatial3') {
+      document.getElementById('mActive').classList.remove('is-active');
+      document.getElementById('mPassive').classList.add('is-active');
+      return;
+    }
+    S.mode='active';  stage.classList.add('active-mode');    document.getElementById('shape-toolbar').classList.add('visible');
+  },
   () => { S.mode='passive'; stage.classList.remove('active-mode'); document.getElementById('shape-toolbar').classList.remove('visible'); }
 );
 document.getElementById('mMotion').addEventListener('click', () => {
   S.motionOn = !S.motionOn;
   document.getElementById('mMotion').classList.toggle('is-active', S.motionOn);
 });
-exclusive('mFixed','mSpatial',
-  () => { S.movement='fixed';   S.spatialX=0; },
-  () => { S.movement='spatial'; S.spatialX=0; }
-);
+// 4-way movement toggle: Fixed / Spatial 1 / Spatial 2 (figure-8) / Spatial 3 (sphere)
+const movementIds = ['mFixed','mSpatial','mSpatial2','mSpatial3'];
+const movementVals = { mFixed:'fixed', mSpatial:'spatial', mSpatial2:'spatial2', mSpatial3:'spatial3' };
+movementIds.forEach(id => {
+  document.getElementById(id).addEventListener('click', () => {
+    movementIds.forEach(i => document.getElementById(i).classList.remove('is-active'));
+    document.getElementById(id).classList.add('is-active');
+    S.movement = movementVals[id];
+    S.spatialX = 0; S.driftY = 0;
+    // Spatial 3 (sphere): clear all interactive elements and force passive mode
+    if (S.movement === 'spatial3') {
+      S.shapes = [];
+      S.networkNodes = null;
+      rebuild();
+      if (S.mode === 'active') document.getElementById('mPassive').click();
+    }
+  });
+});
 
 // ================================================================
 // SLIDERS (native range)
@@ -2406,15 +2556,14 @@ setupSlider('densityRange', 'densityBadge', false, v => { S.density = v; rebuild
 setupSlider('seedRange',    'seedBadge',    true,  v => { S.seed = v; rebuildWithTransition(); });
 
 document.getElementById('resetBtn').addEventListener('click', () => {
-  S.speed=.5; S.density=.5; S.seed=5; S.shapes=[]; S.movement='fixed'; S.spatialX=0; shapeDrag=null;
+  // Reset only sliders/shapes — motion mode, spatial state preserved
+  S.speed=.5; S.density=.5; S.seed=5; S.shapes=[]; shapeDrag=null;
   document.getElementById('speedRange').value   = 50;
   document.getElementById('densityRange').value = 50;
   document.getElementById('seedRange').value    = 5;
   document.getElementById('speedBadge').textContent   = '50%';
   document.getElementById('densityBadge').textContent = '50%';
   document.getElementById('seedBadge').textContent    = '5';
-  document.getElementById('mFixed').classList.add('is-active');
-  document.getElementById('mSpatial').classList.remove('is-active');
   S.motionOn = true;
   document.getElementById('mMotion').classList.add('is-active');
   // Reset invert
@@ -2471,7 +2620,7 @@ function injectPNGpHYs(arrayBuf, dpi) {
 
 // Draw network corner-to-node connections in the CURRENT context coordinate space.
 // Call this inside an already-scaled context (same level as paths), with drift in screen-space.
-function drawNetworkCornerConnections(ctx, drift) {
+function drawNetworkCornerConnections(ctx, drift, driftY = 0) {
   if (S.pattern !== 'networks' || !S.networkNodes || !S.shapes.length) return;
   for (const sh of S.shapes) {
     const corners = [
@@ -2481,11 +2630,11 @@ function drawNetworkCornerConnections(ctx, drift) {
     for (const c of corners) {
       let bestD = Infinity, bestN = null;
       for (const n of S.networkNodes) {
-        const d = Math.hypot(c.x - (n.x + drift), c.y - n.y);
+        const d = Math.hypot(c.x - (n.x + drift), c.y - (n.y + driftY));
         if (d < bestD) { bestD = d; bestN = n; }
       }
       if (bestN && bestD < 600) {
-        const nx = bestN.x + drift, ny = bestN.y;
+        const nx = bestN.x + drift, ny = bestN.y + driftY;
         const dx = nx - c.x, dy = ny - c.y;
         const steps = Math.max(1, Math.ceil(Math.hypot(dx, dy) / 6));
         const pts = [];
@@ -2559,10 +2708,43 @@ function drawExportPaths(ctx, drift) {
   }
 }
 
+// Draw sphere projection into ctx (ctx must already be scaled to export dimensions).
+// rotAngle drives the globe spin. The caller fills the background before calling this.
+function drawExportSphere(ctx, rotAngle) {
+  const SR = Math.min(W, H) * 0.44;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(W * 0.5, H * 0.5, SR, 0, Math.PI * 2);
+  ctx.clip();
+  for (const p of paths) {
+    if (p.screenFixed) continue;
+    const srcPts = p.flat ? p.flat : (p.pts && p.pts.length > 1 ? flattenPath(p.pts) : null);
+    if (!srcPts || srcPts.length < 2) continue;
+    let seg = [];
+    for (const pt of srcPts) {
+      const pp = sphereProject(pt.x, pt.y, rotAngle);
+      if (pp) { seg.push(pp); } else {
+        if (seg.length > 2) drawUnits(ctx, flattenPath(seg), p.off, S.lineColor);
+        seg = [];
+      }
+    }
+    if (seg.length > 2) drawUnits(ctx, flattenPath(seg), p.off, S.lineColor);
+  }
+  ctx.restore();
+}
+
 function renderPatternToCanvas(ew, eh) {
   const tc = document.createElement('canvas'); tc.width=ew; tc.height=eh;
   const tx = tc.getContext('2d');
   const sx = ew / W, sy = eh / H;
+
+  if (S.movement === 'spatial3') {
+    // Sphere export: capture current rotation snapshot
+    tx.save(); tx.scale(sx, sy);
+    drawExportSphere(tx, S.spatialX);
+    tx.restore();
+    return tc;
+  }
 
   // Phase 1: Draw pattern paths (city blocks re-clipped, network lines, terrain splits)
   tx.save();
@@ -2683,8 +2865,12 @@ document.getElementById('exVideo').addEventListener('click', () => {
   // Renders one full seamless loop frame-by-frame to an off-screen canvas,
   // captured as H.264 MP4 via MediaRecorder (native in Chrome/Safari on macOS).
 
-  const FPS    = 30;
-  const FRAMES = 150;   // 5-second loop at 30fps
+  const FPS = 30;
+  // FRAMES is computed per mode so the export speed matches the live animation.
+  // spatial + spatial2: liveInc = π/300 → FRAMES = 300 = 10s at 30fps (both same speed)
+  // spatial/spatial2: 300 frames = 10s | spatial3 (sphere): 900 frames = 30s | other: 150 frames = 5s
+  const FRAMES = S.movement === 'spatial3' ? 900
+               : (S.movement === 'spatial' || S.movement === 'spatial2') ? 300 : 150;
   const SPATIAL_STEP = (2 * Math.PI) / FRAMES;
   const sm = 0.5 + S.speed * 3;
   const saved = paths.map(p => p.off);
@@ -2724,16 +2910,26 @@ document.getElementById('exVideo').addEventListener('click', () => {
   const oc = document.createElement('canvas'); oc.width = EW; oc.height = EH;
   const octx = oc.getContext('2d');
 
-  function drawVideoFrame(drift) {
+  function drawVideoFrame(drift, driftY = 0, s4rot = 0) {
     const sx = EW / W, sy = EH / H;
 
-    // Phase 1: Fill background + draw pattern paths
     octx.fillStyle = S.canvasBg;
     octx.fillRect(0, 0, EW, EH);
+
+    if (S.movement === 'spatial3') {
+      // Sphere export: one full rotation per loop (perfect 5s cycle)
+      octx.save(); octx.scale(sx, sy);
+      drawExportSphere(octx, s4rot);
+      octx.restore();
+      return;
+    }
+
+    // Phase 1: Fill background + draw pattern paths
     octx.save();
     octx.scale(sx, sy);
     octx.save();
-    octx.translate(drift, 0);
+    octx.translate(drift, driftY);
+    S.driftY = driftY;
     drawExportPaths(octx, drift);
     octx.restore();   // remove drift
     octx.restore();   // remove scale
@@ -2750,7 +2946,7 @@ document.getElementById('exVideo').addEventListener('click', () => {
     octx.save();
     octx.scale(sx, sy);
     drawExportPerimeters(octx);
-    drawNetworkCornerConnections(octx, drift);
+    drawNetworkCornerConnections(octx, drift, driftY);
     octx.restore();
   }
 
@@ -2764,7 +2960,8 @@ document.getElementById('exVideo').addEventListener('click', () => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.download = 'pattern-loop.mp4'; a.href = url; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
-    toast('Exported pattern-loop.mp4 (1920×1080 H.264, 5s)');
+    const dur = Math.round(FRAMES / FPS);
+    toast(`Exported pattern-loop.mp4 (1920×1080 H.264, ${dur}s)`);
     cleanup();
   };
 
@@ -2779,8 +2976,12 @@ document.getElementById('exVideo').addEventListener('click', () => {
     if (now - lastFrameTime >= MS_PER_FRAME - 1) {
       lastFrameTime += MS_PER_FRAME;  // advance by fixed step to avoid drift
       paths.forEach(p => { p.off = p._s0 + f * (p._ls || p.sp) * sm * 0.4; });
-      const drift = S.movement === 'spatial' ? Math.sin(f * SPATIAL_STEP) * 120 : 0;
-      drawVideoFrame(drift);
+      const drift  = S.movement === 'spatial'  ? Math.sin(f * SPATIAL_STEP) * 120
+                   : S.movement === 'spatial2' ? Math.sin(f * SPATIAL_STEP) * 85 : 0;
+      const driftY = S.movement === 'spatial2' ? Math.sin(f * SPATIAL_STEP * 2) * 50 : 0;
+      // Spatial3: one full globe rotation per loop (SPATIAL_STEP = 2π/300, matches 10s live cycle)
+      const s4rot  = S.movement === 'spatial3' ? f * SPATIAL_STEP : 0;
+      drawVideoFrame(drift, driftY, s4rot);
       bar.style.width = ((f + 1) / FRAMES * 100) + '%';
       f++;
       if (f >= FRAMES) {
@@ -2799,9 +3000,12 @@ document.getElementById('exVideo').addEventListener('click', () => {
 // ================================================================
 (function initDefaults() {
   applyTheme('light', false);
-  // Sync initial UI state — mode is 'active' by default
-  stage.classList.add('active-mode');
-  document.getElementById('shape-toolbar').classList.add('visible');
+  // Start in passive mode — interactive mode must be explicitly chosen by the user
+  S.mode = 'passive';
+  stage.classList.remove('active-mode');
+  document.getElementById('shape-toolbar').classList.remove('visible');
+  document.getElementById('mPassive').classList.add('is-active');
+  document.getElementById('mActive').classList.remove('is-active');
 })();
 
 resize();
