@@ -79,10 +79,6 @@
     <section class="group">
       <div class="group__title">Motion</div>
       <div class="group__inner">
-        <div class="controls-row cols-2">
-          <button id="mActive"  class="btn is-active">Interactive</button>
-          <button id="mPassive" class="btn">Passive</button>
-        </div>
         <div class="controls-row cols-1">
           <button id="mMotion" class="btn is-active">Animate Lines</button>
         </div>
@@ -181,12 +177,6 @@
   <!-- ═══════════ STAGE ═══════════ -->
   <main class="stage" id="stage">
     <canvas id="pattern-canvas"></canvas>
-    <div id="cursor-ring"></div>
-
-    <div id="shape-toolbar">
-      <button class="btn" id="addRectBtn">+ Rectangle</button>
-      <button class="btn" id="clrBtn">Clear</button>
-    </div>
   </main>
 
   <!-- ═══════════ INFO PANEL ═══════════ -->
@@ -220,13 +210,11 @@
     <section class="info-section">
       <h3>Motion</h3>
       <ul>
-        <li><strong>Interactive</strong> — Place rectangles on the canvas to create open areas in the pattern for content or images.</li>
-        <li><strong>Passive</strong> — The pattern animates on its own.</li>
         <li><strong>Animate Lines</strong> — Turn line movement on or off.</li>
         <li><strong>Fixed</strong> — Pattern stays in place.</li>
         <li><strong>Spatial 1</strong> — Slow horizontal drift, looping smoothly left and right.</li>
         <li><strong>Spatial 2</strong> — Figure-eight drift, moving in both horizontal and vertical axes.</li>
-        <li><strong>Spatial 3</strong> — The pattern wraps around a rotating globe. Passive mode only.</li>
+        <li><strong>Spatial 3</strong> — The pattern wraps around a rotating globe.</li>
       </ul>
     </section>
 
@@ -238,11 +226,6 @@
         <li><strong>Seed</strong> — Generate a new version of the pattern.</li>
         <li><strong>Reset</strong> — Return everything to default.</li>
       </ul>
-    </section>
-
-    <section class="info-section">
-      <h3>Rectangles (Interactive mode)</h3>
-      <p>Click + Rectangle, then drag on the canvas to place one. The pattern will adapt around it. Use Clear to remove all rectangles.</p>
     </section>
 
     <section class="info-section">

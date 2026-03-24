@@ -10,7 +10,7 @@ const S = {
   lineColor: '#FFFFFF', canvasBg: '#DFDFDF',
   shapes: [],
   mx: -9999, my: -9999, recording: false,
-  networkNodes: null
+  networkNodes: null, networkNodes3D: null
 };
 
 // 4 base themes — Invert button swaps lc ↔ bg at runtime
@@ -80,10 +80,13 @@ const GEO = {
   ],
 
   /**
-   * Generate deterministic permutation table from seed
-   * Same seed → same permutation → reproducible noise
+   * Generate deterministic permutation table from seed.
+   * Results are cached by seed — each unique seed generates its table once.
    */
+  _permCache: new Map(),
+
   _permute: function(seed) {
+    if (this._permCache.has(seed)) return this._permCache.get(seed);
     const perm = [];
     for (let i = 0; i < 256; i++) perm[i] = i;
     const rng = mkRand(seed);
@@ -91,48 +94,39 @@ const GEO = {
       const j = Math.floor(rng() * (i + 1));
       [perm[i], perm[j]] = [perm[j], perm[i]];
     }
+    this._permCache.set(seed, perm);
     return perm;
   },
 
   /**
-   * Core Perlin noise: 2D lattice gradient noise with Hermite interpolation
-   * Returns normalized value in [-1, 1] range (clamped at ±0.95 to avoid spikes)
+   * Core Perlin noise implementation shared by both standard and tileable variants.
+   * pW / pH control the lattice period — use 256 for standard (non-tileable) noise,
+   * or a smaller integer for seamless tiling at that period.
    */
-  perlinNoise: function(x, y, seed) {
-    const perm = this._permute(seed);
+  _perlinCore: function(x, y, pW, pH, seed) {
+    const perm  = this._permute(seed);
     const grads = this._gradients;
+    const fade  = t => t * t * t * (t * (t * 6 - 15) + 10);
+    const lerp  = (t, a, b) => a + t * (b - a);
+    const xi = Math.floor(x) | 0, yi = Math.floor(y) | 0;
+    const xf = x - xi,            yf = y - yi;
+    const xi0 = ((xi % pW) + pW) % pW, xi1 = (xi0 + 1) % pW;
+    const yi0 = ((yi % pH) + pH) % pH, yi1 = (yi0 + 1) % pH;
+    const gi00 = perm[(perm[xi0 & 255] + yi0) & 255] & 15;
+    const gi10 = perm[(perm[xi1 & 255] + yi0) & 255] & 15;
+    const gi01 = perm[(perm[xi0 & 255] + yi1) & 255] & 15;
+    const gi11 = perm[(perm[xi1 & 255] + yi1) & 255] & 15;
+    const g00  = grads[gi00].x * xf       + grads[gi00].y * yf;
+    const g10  = grads[gi10].x * (xf - 1) + grads[gi10].y * yf;
+    const g01  = grads[gi01].x * xf       + grads[gi01].y * (yf - 1);
+    const g11  = grads[gi11].x * (xf - 1) + grads[gi11].y * (yf - 1);
+    const u = fade(xf), v = fade(yf);
+    return Math.max(-0.95, Math.min(0.95, lerp(v, lerp(u, g00, g10), lerp(u, g01, g11)))) / 0.95;
+  },
 
-    // Lattice coordinates
-    const xi = Math.floor(x) & 255;
-    const yi = Math.floor(y) & 255;
-    const xf = x - Math.floor(x);
-    const yf = y - Math.floor(y);
-
-    // Hermite fade function (smooth interpolation)
-    const fade = (t) => t * t * t * (t * (t * 6 - 15) + 10);
-    const u = fade(xf);
-    const v = fade(yf);
-
-    // Gradient indices at four corners
-    const gi00 = perm[(perm[xi] + yi) & 255] & 15;
-    const gi10 = perm[(perm[(xi + 1) & 255] + yi) & 255] & 15;
-    const gi01 = perm[(perm[xi] + (yi + 1) & 255) & 255] & 15;
-    const gi11 = perm[(perm[(xi + 1) & 255] + (yi + 1) & 255) & 255] & 15;
-
-    // Gradient dot products
-    const g00 = grads[gi00].x * xf + grads[gi00].y * yf;
-    const g10 = grads[gi10].x * (xf - 1) + grads[gi10].y * yf;
-    const g01 = grads[gi01].x * xf + grads[gi01].y * (yf - 1);
-    const g11 = grads[gi11].x * (xf - 1) + grads[gi11].y * (yf - 1);
-
-    // Interpolation
-    const lerp = (t, a, b) => a + t * (b - a);
-    const nx0 = lerp(u, g00, g10);
-    const nx1 = lerp(u, g01, g11);
-    const result = lerp(v, nx0, nx1);
-
-    // Clamp to avoid harsh spikes; normalize for stable contours
-    return Math.max(-0.95, Math.min(0.95, result)) * (1 / 0.95);
+  /** Standard (non-tileable) Perlin noise — delegates to _perlinCore with period 256 */
+  perlinNoise: function(x, y, seed) {
+    return this._perlinCore(x, y, 256, 256, seed);
   },
 
   /**
@@ -167,30 +161,9 @@ const GEO = {
     return maxAmplitude > 0 ? result / maxAmplitude : 0;
   },
 
-  // ── Tileable noise: lattice wraps at exact canvas boundaries ──────────────
-  // perlinNoiseTileable(x, y, pW, pH, seed):
-  //   Identical gradient noise to perlinNoise, but the gradient lattice
-  //   wraps at integer period pW (x) and pH (y) so the field is periodic:
-  //   f(x,y) = f(x+pW, y) = f(x, y+pH).  Both pW and pH must be ≤ 255.
+  /** Tileable Perlin noise — delegates to _perlinCore with explicit lattice period */
   perlinNoiseTileable: function(x, y, pW, pH, seed) {
-    const perm  = this._permute(seed);
-    const grads = this._gradients;
-    const fade  = t => t * t * t * (t * (t * 6 - 15) + 10);
-    const lerp  = (t, a, b) => a + t * (b - a);
-    const xi = Math.floor(x) | 0,  yi = Math.floor(y) | 0;
-    const xf = x - xi,              yf = y - yi;
-    const xi0 = ((xi % pW) + pW) % pW,  xi1 = (xi0 + 1) % pW;
-    const yi0 = ((yi % pH) + pH) % pH,  yi1 = (yi0 + 1) % pH;
-    const gi00 = perm[(perm[xi0 & 255] + yi0) & 255] & 15;
-    const gi10 = perm[(perm[xi1 & 255] + yi0) & 255] & 15;
-    const gi01 = perm[(perm[xi0 & 255] + yi1) & 255] & 15;
-    const gi11 = perm[(perm[xi1 & 255] + yi1) & 255] & 15;
-    const g00  = grads[gi00].x * xf        + grads[gi00].y * yf;
-    const g10  = grads[gi10].x * (xf - 1)  + grads[gi10].y * yf;
-    const g01  = grads[gi01].x * xf        + grads[gi01].y * (yf - 1);
-    const g11  = grads[gi11].x * (xf - 1)  + grads[gi11].y * (yf - 1);
-    const u = fade(xf), v = fade(yf);
-    return Math.max(-0.95, Math.min(0.95, lerp(v, lerp(u, g00, g10), lerp(u, g01, g11)))) / 0.95;
+    return this._perlinCore(x, y, pW, pH, seed);
   },
 
   // fBmTileable(px, py, Wp, Hp, seed, octaves, persistence, lacunarity):
@@ -282,12 +255,12 @@ const GEO = {
   },
 
   /**
-   * Smooth a polyline using Catmull-Rom spline interpolation
+   * Smooth a polyline using Catmull-Rom spline interpolation.
+   * steps controls subdivision density (8 = high quality, 4 = lighter weight).
    */
-  smoothCatmullRom: function(pts, tension = 0.5) {
+  smoothCatmullRom: function(pts, tension = 0.5, steps = 8) {
     if (pts.length < 3) return pts;
     const out = [pts[0]];
-    const steps = 8;
     for (let i = 0; i < pts.length - 1; i++) {
       const p0 = i === 0 ? pts[0] : pts[i - 1];
       const p1 = pts[i];
@@ -421,39 +394,6 @@ const GEO = {
   pointInRect: (p, rx, ry, rw, rh) => (
     p.x >= rx && p.x <= rx + rw && p.y >= ry && p.y <= ry + rh
   ),
-
-  /**
-   * Simple convex hull for network relaxation (Graham scan)
-   */
-  convexHull: function(pts) {
-    if (pts.length < 3) return pts;
-    const sorted = [...pts].sort((a, b) => a.x !== b.x ? a.x - b.x : a.y - b.y);
-    const lower = [];
-    for (let p of sorted) {
-      while (lower.length >= 2) {
-        const last = lower[lower.length - 1];
-        const prev = lower[lower.length - 2];
-        if ((last.x - prev.x) * (p.y - prev.y) - (last.y - prev.y) * (p.x - prev.x) <= 0) {
-          lower.pop();
-        } else break;
-      }
-      lower.push(p);
-    }
-    const upper = [];
-    for (let i = sorted.length - 1; i >= 0; i--) {
-      const p = sorted[i];
-      while (upper.length >= 2) {
-        const last = upper[upper.length - 1];
-        const prev = upper[upper.length - 2];
-        if ((last.x - prev.x) * (p.y - prev.y) - (last.y - prev.y) * (p.x - prev.x) <= 0) {
-          upper.pop();
-        } else break;
-      }
-      upper.push(p);
-    }
-    lower.pop(); upper.pop();
-    return lower.concat(upper);
-  },
 
   /**
    * PHASE 3: Simple line intersection detection for street graphs
@@ -632,40 +572,6 @@ const GEO = {
       x: p.x + normals[i].x * distance,
       y: p.y + normals[i].y * distance
     }));
-  },
-
-  /**
-   * NEW: Smooth polyline using Catmull-Rom (reusable)
-   */
-  smoothPolylineSimple: function(pts, tension = 0.5) {
-    if (pts.length < 3) return pts;
-    const out = [pts[0]];
-    const steps = 4;  // Lower than Catmull-Rom for performance
-
-    for (let i = 0; i < pts.length - 1; i++) {
-      const p0 = i === 0 ? pts[0] : pts[i - 1];
-      const p1 = pts[i];
-      const p2 = pts[i + 1];
-      const p3 = i + 2 < pts.length ? pts[i + 2] : p2;
-
-      for (let t = 1; t <= steps; t++) {
-        const u = t / steps;
-        const u2 = u * u, u3 = u2 * u;
-
-        const c0 = -tension * u3 + 2 * tension * u2 - tension * u;
-        const c1 = (2 - tension) * u3 + (tension - 3) * u2 + 1;
-        const c2 = (tension - 2) * u3 + (3 - 2 * tension) * u2 + tension * u;
-        const c3 = tension * u3 - tension * u2;
-
-        out.push({
-          x: c0 * p0.x + c1 * p1.x + c2 * p2.x + c3 * p3.x,
-          y: c0 * p0.y + c1 * p1.y + c2 * p2.y + c3 * p3.y
-        });
-      }
-    }
-
-    out.push(pts[pts.length - 1]);
-    return out;
   },
 
   /**
@@ -946,8 +852,12 @@ function buildTerrain(r, n) {
 
     for (const chain of chains) {
       if (chain.length >= 8) {
-        const pts = GEO.smoothCatmullRom(chain, 0.5);
-        paths.push({ pts, off: r() * UNIT * 4, sp: 0.15 + r() * 0.25 });
+        // Store raw chain as pts (used by splitPathAtShapes when shapes are present).
+        // Pre-compute flattenPath output as flat for direct rendering — flattenPath's
+        // conservative midpoint-bezier avoids the overshoots Catmull-Rom can produce
+        // at tight bends, which caused the bar ribbon to break visually.
+        const flat = flattenPath(chain);
+        paths.push({ pts: chain, flat, off: r() * UNIT * 4, sp: 0.15 + r() * 0.15 });
       }
     }
   }
@@ -1208,12 +1118,19 @@ function buildPathways(r, n) {
 
 function rebuild() {
   const r = mkRand(S.seed * 7919 + 13);
-  paths = []; S.networkNodes = null;
+  paths = []; S.networkNodes = null; S.networkNodes3D = null;
   const n = Math.floor(5 + S.density * 30);
-  if      (S.pattern === 'pathways') buildPathways(r, n);
-  else if (S.pattern === 'terrain')  buildTerrain(r, n);
-  else if (S.pattern === 'city')     buildCity(r, n);
-  else                               buildNetworks(r, n);
+  if (S.movement === 'spatial3') {
+    if      (S.pattern === 'pathways') buildPathwaysSphere(r, n);
+    else if (S.pattern === 'terrain')  buildTerrainSphere(r, n);
+    else if (S.pattern === 'city')     buildCitySphere(r, n);
+    else                               buildNetworksSphere(r, n);
+  } else {
+    if      (S.pattern === 'pathways') buildPathways(r, n);
+    else if (S.pattern === 'terrain')  buildTerrain(r, n);
+    else if (S.pattern === 'city')     buildCity(r, n);
+    else                               buildNetworks(r, n);
+  }
 }
 
 
@@ -1358,9 +1275,6 @@ function buildCity(r, n) {
         }
         if (maxX - minX < MIN_BLOCK || maxY - minY < MIN_BLOCK) continue;
 
-        // Store polygon corners as structural vertices for rigid repulsion
-        const verts = poly.map(p => ({ x: p.x, y: p.y }));
-
         const ring = [...poly, poly[0]];
         const pts = [];
         for (let i = 0; i < ring.length - 1; i++) {
@@ -1375,7 +1289,7 @@ function buildCity(r, n) {
         pts.push(pts[0]);
 
         if (pts.length > 4) {
-          paths.push({ pts, off: rng() * UNIT * 2, sp: 0.15 + rng() * 0.2, rigid: true, verts,
+          paths.push({ pts, off: rng() * UNIT * 2, sp: 0.15 + rng() * 0.15, rigid: true,
                         blockPoly: poly.map(p => ({ x: p.x, y: p.y })),
                         blockRoadW: roadWidth });
         }
@@ -1390,30 +1304,19 @@ function buildCity(r, n) {
 /**
  * NETWORKS GENERATOR — Delaunay triangulation filling full canvas
  * DESIGN: Dense node scatter → full Delaunay triangulation → straight edges + visible node dots
- * Reference: uniform triangulated mesh filling edge-to-edge
  */
 function buildNetworks(r, n) {
-  // Node count: min density denser than before, max density has real weight
-  // n ranges 5..35 → nc ranges ~24..62
   const nc = Math.max(20, Math.floor(18 + n * 1.25));
   const nodes = [];
+  const offRng = mkRand(S.seed * 99991 + 7);
 
   // Bleed beyond canvas edges so triangulation mesh extends off all sides
-  const bleed = 200;
+  const bleed = 150;
   const areaW = W + bleed * 2;
   const areaH = H + bleed * 2;
 
-  // Convert screen-space shapes to world-space for node/edge rejection
-  const curDriftX = S.movement === 'spatial'  ? Math.sin(S.spatialX) * 120
-                  : S.movement === 'spatial2' ? Math.sin(S.spatialX) * 85 : 0;
-  const curDriftY = S.movement === 'spatial2' ? Math.sin(S.spatialX * 2) * 50 : 0;
-  const savedShapes = S.shapes;
-  if (curDriftX !== 0 || curDriftY !== 0) {
-    S.shapes = S.shapes.map(sh => ({ x: sh.x - curDriftX, y: sh.y - curDriftY, w: sh.w, h: sh.h }));
-  }
-
-  // Poisson-disk scatter filling canvas + bleed area
-  const minDist = Math.sqrt((areaW * areaH) / nc) * 0.55;
+  // Poisson-disk scatter with tighter packing for better edge coverage
+  const minDist = Math.sqrt((areaW * areaH) / nc) * 0.50;
   let attempts = 0;
   while (nodes.length < nc && attempts < nc * 20) {
     const x = -bleed + r() * areaW;
@@ -1422,41 +1325,14 @@ function buildNetworks(r, n) {
     for (const node of nodes) {
       if (Math.hypot(x - node.x, y - node.y) < minDist) { tooClose = true; break; }
     }
-    // Reject nodes inside (or too close to) shape rectangles
-    if (!tooClose && S.shapes.length > 0 && ptInAnyShape(x, y, 18)) { attempts++; continue; }
     if (!tooClose) nodes.push({ x, y });
     attempts++;
   }
 
-  // ── Ghost nodes for seamless X-seam (sphere wrapping + tiling) ──────────
-  // Nodes near the left/right canvas edges are mirrored on the opposite side
-  // so Delaunay naturally produces edges that cross the seam boundary.
-  // In sphere mode these project correctly onto the sphere surface.
-  // In flat modes the off-canvas portions are simply clipped — no visual change.
-  const GHOST_PAD = bleed * 1.1;
-  const ghosts = [];
-  for (const n of nodes) {
-    // Edge ghosts — connect left↔right and top↔bottom seams
-    if (n.x < GHOST_PAD)               ghosts.push({ x: n.x + W, y: n.y,     src: n });
-    if (n.x > W - GHOST_PAD)           ghosts.push({ x: n.x - W, y: n.y,     src: n });
-    if (n.y < GHOST_PAD)               ghosts.push({ x: n.x,     y: n.y + H, src: n });
-    if (n.y > H - GHOST_PAD)           ghosts.push({ x: n.x,     y: n.y - H, src: n });
-    // Corner ghosts — fill the 4 diagonal seam intersections
-    if (n.x < GHOST_PAD && n.y < GHOST_PAD)           ghosts.push({ x: n.x + W, y: n.y + H, src: n });
-    if (n.x < GHOST_PAD && n.y > H - GHOST_PAD)       ghosts.push({ x: n.x + W, y: n.y - H, src: n });
-    if (n.x > W - GHOST_PAD && n.y < GHOST_PAD)       ghosts.push({ x: n.x - W, y: n.y + H, src: n });
-    if (n.x > W - GHOST_PAD && n.y > H - GHOST_PAD)   ghosts.push({ x: n.x - W, y: n.y - H, src: n });
-  }
-
-  // Full Delaunay triangulation including ghost nodes for seam-crossing edges
-  const delaunayEdges = GEO.delaunayTriangulate([...nodes, ...ghosts]);
+  // Full Delaunay triangulation — bleed-area nodes ensure edges reach all 4 borders
+  const delaunayEdges = GEO.delaunayTriangulate(nodes);
 
   for (const [p0, p1] of delaunayEdges) {
-    if (p0.src && p1.src) continue;  // both ghosts — not a useful edge
-    // Skip edges that pass through a shape rectangle
-    if (S.shapes.length > 0 && segCrossesAnyShape(p0, p1)) continue;
-    // Store structural endpoints — interpolation happens at draw time
-    // so repulsion can move endpoints and re-interpolate a straight line
     const dx = p1.x - p0.x, dy = p1.y - p0.y;
     const steps = Math.ceil(Math.hypot(dx, dy) / 6);
     const pts = [];
@@ -1464,42 +1340,11 @@ function buildNetworks(r, n) {
       const t = i / steps;
       pts.push({ x: p0.x + dx * t, y: p0.y + dy * t });
     }
-    paths.push({ pts, off: r() * UNIT * 2, sp: 0.5 + r() * 0.8, rigid: true,
-                  verts: [{ x: p0.x, y: p0.y }, { x: p1.x, y: p1.y }] });
+    paths.push({ pts, off: offRng() * UNIT * 2, sp: 0.15 + offRng() * 0.15, rigid: true });
   }
 
-  // Restore original screen-space shapes
-  S.shapes = savedShapes;
-
-  // ── Rectangle integration: perimeter edges + dynamic corner connections ──
-  for (const sh of S.shapes) {
-    const corners = [
-      { x: sh.x, y: sh.y },
-      { x: sh.x + sh.w, y: sh.y },
-      { x: sh.x + sh.w, y: sh.y + sh.h },
-      { x: sh.x, y: sh.y + sh.h },
-    ];
-
-    // 4 perimeter edges connecting the corners
-    for (let ci = 0; ci < 4; ci++) {
-      const a = corners[ci], b = corners[(ci + 1) % 4];
-      const dx = b.x - a.x, dy = b.y - a.y;
-      const steps = Math.ceil(Math.hypot(dx, dy) / 6);
-      const pts = [];
-      for (let j = 0; j <= steps; j++) {
-        const t = j / steps;
-        pts.push({ x: a.x + dx * t, y: a.y + dy * t });
-      }
-      if (pts.length > 2) {
-        paths.push({ pts, off: r() * UNIT * 2, sp: 0.5 + r() * 0.8, rigid: true, screenFixed: true });
-      }
-    }
-
-    // Corner-to-node connections are drawn dynamically at draw time
-    // so they stay connected as the pattern drifts in spatial mode.
-  }
-
-  S.networkNodes = nodes;
+  // Only store canvas-visible nodes for dot rendering
+  S.networkNodes = nodes.filter(nd => nd.x >= 0 && nd.x <= W && nd.y >= 0 && nd.y <= H);
 }
 
 // ================================================================
@@ -1917,6 +1762,41 @@ function flattenPath(pts) {
   return flat;
 }
 
+// Insert guide points near each corner of a polygon so flattenPath's midpoint-bezier
+// rounds them into smooth curves instead of sharp kinks.
+// r = chamfer distance along each edge; auto-clamped to half the shorter adjacent edge.
+function chamferPoly(verts, r) {
+  const n = verts.length;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const prev = verts[(i - 1 + n) % n];
+    const cur  = verts[i];
+    const next = verts[(i + 1) % n];
+    const d1 = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+    const d2 = Math.hypot(next.x - cur.x,  next.y - cur.y);
+    const cr = Math.min(r, d1 * 0.4, d2 * 0.4);
+    if (cr > 1 && d1 > 0 && d2 > 0) {
+      out.push({ x: cur.x + (prev.x - cur.x) / d1 * cr, y: cur.y + (prev.y - cur.y) / d1 * cr });
+      out.push({ x: cur.x + (next.x - cur.x) / d2 * cr, y: cur.y + (next.y - cur.y) / d2 * cr });
+    } else {
+      out.push(cur);
+    }
+  }
+  return out;
+}
+
+// Binary-search a cumulative-distance array to find position + angle at arc length d.
+// Shared by drawUnits (canvas) and the SVG export.
+function pointAtDistance(flat, dists, totalLen, d) {
+  d = Math.max(0, Math.min(totalLen, d));
+  let lo = 0, hi = dists.length - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (dists[mid] <= d) lo = mid; else hi = mid; }
+  const segLen = dists[hi] - dists[lo], t = segLen > 0 ? (d - dists[lo]) / segLen : 0;
+  return { x: flat[lo].x + (flat[hi].x - flat[lo].x) * t,
+           y: flat[lo].y + (flat[hi].y - flat[lo].y) * t,
+           angle: Math.atan2(flat[hi].y - flat[lo].y, flat[hi].x - flat[lo].x) };
+}
+
 // Draw filled circle+bar units along a flattened path (matches Lines.svg style)
 function drawUnits(ctx, flat, off, color) {
   if (flat.length < 2) return;
@@ -1924,14 +1804,7 @@ function drawUnits(ctx, flat, off, color) {
   for (let i = 1; i < flat.length; i++)
     dists.push(dists[i-1] + Math.hypot(flat[i].x-flat[i-1].x, flat[i].y-flat[i-1].y));
   const totalLen = dists[dists.length-1];
-  function atDist(d) {
-    d = Math.max(0, Math.min(totalLen, d));
-    let lo = 0, hi = dists.length-1;
-    while (hi-lo > 1) { const mid=(lo+hi)>>1; if (dists[mid]<=d) lo=mid; else hi=mid; }
-    const segLen = dists[hi]-dists[lo], t = segLen>0 ? (d-dists[lo])/segLen : 0;
-    return { x:flat[lo].x+(flat[hi].x-flat[lo].x)*t, y:flat[lo].y+(flat[hi].y-flat[lo].y)*t,
-             angle:Math.atan2(flat[hi].y-flat[lo].y, flat[hi].x-flat[lo].x) };
-  }
+  const atDist = d => pointAtDistance(flat, dists, totalLen, d);
   ctx.fillStyle = color;
   for (let d = -(off%UNIT); d < totalLen; d += UNIT) {
     // Filled circle
@@ -1958,6 +1831,602 @@ function drawUnits(ctx, flat, off, color) {
       for (let si = 1; si <= steps; si++) ctx.lineTo(top[si].x, top[si].y);
       for (let si = steps; si >= 0; si--) ctx.lineTo(bot[si].x, bot[si].y);
       ctx.closePath(); ctx.fill();
+    }
+  }
+}
+
+// ================================================================
+// SPHERE-NATIVE PATTERN BUILDERS  (Spatial 3 mode only)
+// Paths are stored as {pts3D:[{x,y,z},...]} unit-sphere vectors.
+// No equirectangular projection — geometry lives directly on the sphere.
+// ================================================================
+
+// Terrain: seamlessly-tiling scalar field on sphere → marching squares → 3D contours
+function buildTerrainSphere(r, n) {
+  const seed = Math.floor(r() * 10000);
+  // Fewer octaves than flat — sphere shows all contours (none clip off edges), so less detail needed
+  const octaves = Math.max(2, Math.min(3, Math.floor(1 + n * 0.8)));
+  const COLS = 120, ROWS = 60;  // 2:1 matches longitude:latitude angular range
+
+  // Spherical noise: tiles in longitude (phi), free in colatitude (theta)
+  function sphereField(col, row) {
+    const phi   = (col % COLS) / COLS;   // [0,1) — wraps at COLS
+    const theta = row / ROWS;            // [0,1]  — pole-to-pole, no wrap
+    const CELLS = 4;
+    let amp = 1, freq = 1, val = 0, maxAmp = 0;
+    for (let oi = 0; oi < octaves; oi++) {
+      const c = Math.round(CELLS * freq);
+      val += amp * GEO.perlinNoiseTileable(phi * c, theta * c, c, c * 2, seed + oi * 1000);
+      maxAmp += amp; amp *= 0.5; freq *= 2.0;
+    }
+    return maxAmp > 0 ? val / maxAmp : 0;
+  }
+
+  const grid = [];
+  let hMin = Infinity, hMax = -Infinity;
+  for (let row = 0; row <= ROWS; row++) {
+    grid[row] = new Float32Array(COLS + 1);
+    for (let col = 0; col <= COLS; col++) {
+      const v = sphereField(col, row);
+      grid[row][col] = v;
+      if (v < hMin) hMin = v; if (v > hMax) hMax = v;
+    }
+  }
+
+  // (col_frac, row_frac) in logical grid space → 3D unit vector
+  const toSphere = (col, row) => {
+    const phi = (col / COLS) * 2 * Math.PI, theta = (row / ROWS) * Math.PI;
+    return { x: Math.sin(theta)*Math.cos(phi), y: Math.sin(theta)*Math.sin(phi), z: Math.cos(theta) };
+  };
+
+  // Smooth a 3D chain: average neighbours then renormalize to unit sphere
+  function smooth3D(pts, passes) {
+    let a = pts.slice();
+    for (let p = 0; p < passes; p++) {
+      const out = [a[0]];
+      for (let i = 1; i < a.length - 1; i++) {
+        const ax = (a[i-1].x + a[i].x + a[i+1].x) / 3;
+        const ay = (a[i-1].y + a[i].y + a[i+1].y) / 3;
+        const az = (a[i-1].z + a[i].z + a[i+1].z) / 3;
+        const l  = Math.sqrt(ax*ax + ay*ay + az*az) || 1;
+        out.push({ x: ax/l, y: ay/l, z: az/l });
+      }
+      out.push(a[a.length - 1]);
+      a = out;
+    }
+    return a;
+  }
+
+  // Halve level count vs flat — every contour loop is fully visible on sphere
+  const numLevels = Math.max(3, Math.floor(3 + n * 0.3));
+  const mg = (hMax - hMin) * 0.05;
+  for (let li = 1; li <= numLevels; li++) {
+    const level = hMin + mg + (li / (numLevels + 1)) * (hMax - hMin - mg * 2);
+    const segs   = GEO.marchingSquares(grid, COLS, ROWS, 1, 1, level);
+    const chains = GEO.chainSegments(segs);
+    for (const chain of chains) {
+      if (chain.length >= 4) {
+        const pts3D = smooth3D(chain.map(pt => toSphere(pt.x, pt.y)), 3);
+        paths.push({ pts3D, off: r() * UNIT * 4, sp: 0.15 + r() * 0.15 });
+      }
+    }
+  }
+}
+
+// Pathways: L-shaped geodesic corridor bundles — proportionate scale, full sphere coverage
+// Each leg is a fixed angular length relative to the trunk's base point (not absolute poles/edges).
+// Two trunk sets (front + back hemisphere) ensure paths are visible throughout the full rotation.
+function buildPathwaysSphere(r, n) {
+  const rng            = mkRand(Math.floor(r() * 10000));
+  const linesPerBundle = Math.max(6, Math.floor(6 + n * 0.27));
+  const angSpacing     = 0.038;   // angular gap between parallel lines
+  const legV           = 1.3;     // vertical arm from equator to pole edge (≈74°)
+  const wrapAng        = 5.5;     // equatorial wrap ≈ 315°
+  const SEG_RATE       = 28;      // steps per radian
+  const CORN_STEP      = 22;
+  const cornAng        = 0.18;    // base corner arc angular radius
+
+  function d3(a,b){ return a.x*b.x+a.y*b.y+a.z*b.z; }
+  function c3(a,b){ return {x:a.y*b.z-a.z*b.y, y:a.z*b.x-a.x*b.z, z:a.x*b.y-a.y*b.x}; }
+  function n3(v)  { const l=Math.sqrt(v.x*v.x+v.y*v.y+v.z*v.z)||1; return {x:v.x/l,y:v.y/l,z:v.z/l}; }
+
+  function sph(phi, theta) {
+    theta = Math.max(0.06, Math.min(Math.PI - 0.06, theta));
+    return { x: Math.sin(theta)*Math.cos(phi), y: Math.sin(theta)*Math.sin(phi), z: Math.cos(theta) };
+  }
+  function slerp(p0, p1, t) {
+    const dd = Math.max(-1, Math.min(1, d3(p0,p1)));
+    const a  = Math.acos(dd);
+    if (a < 0.001) return {x:p0.x*(1-t)+p1.x*t, y:p0.y*(1-t)+p1.y*t, z:p0.z*(1-t)+p1.z*t};
+    const sa = Math.sin(a), f0 = Math.sin((1-t)*a)/sa, f1 = Math.sin(t*a)/sa;
+    return {x:f0*p0.x+f1*p1.x, y:f0*p0.y+f1*p1.y, z:f0*p0.z+f1*p1.z};
+  }
+  function geoArc(p0, p1, steps) {
+    const dd = Math.max(-1, Math.min(1, d3(p0,p1)));
+    const a  = Math.acos(dd);
+    if (a < 0.001) return [p0, p1];
+    const sa = Math.sin(a), pts = [];
+    for (let i = 0; i <= steps; i++) {
+      const t = i/steps, f0 = Math.sin((1-t)*a)/sa, f1 = Math.sin(t*a)/sa;
+      pts.push({x:f0*p0.x+f1*p1.x, y:f0*p0.y+f1*p1.y, z:f0*p0.z+f1*p1.z});
+    }
+    return pts;
+  }
+
+  // Small-circle arc: sweeps from p0 to p1 at constant angular distance from pole.
+  // This is the sphere analog of a planar circular arc — a true smooth curve.
+  function smallArc(pole, p0, p1, steps) {
+    const rr = Math.acos(Math.max(-1, Math.min(1, d3(pole, p0))));
+    if (rr < 1e-4) return geoArc(p0, p1, steps);
+    const cr = Math.cos(rr), sr = Math.sin(rr);
+    // orthonormal frame in the tangent plane of pole, u pointing toward p0
+    const u = n3({x:p0.x-cr*pole.x, y:p0.y-cr*pole.y, z:p0.z-cr*pole.z});
+    const v = n3(c3(pole, u));
+    // angle from u to p1 in this frame
+    const p1r = {x:p1.x-cr*pole.x, y:p1.y-cr*pole.y, z:p1.z-cr*pole.z};
+    const a1  = Math.atan2(d3(p1r,v), d3(p1r,u));
+    const pts = [];
+    for (let i = 0; i <= steps; i++) {
+      const a = a1 * i / steps;
+      pts.push(n3({
+        x: cr*pole.x + sr*(Math.cos(a)*u.x + Math.sin(a)*v.x),
+        y: cr*pole.y + sr*(Math.cos(a)*u.y + Math.sin(a)*v.y),
+        z: cr*pole.z + sr*(Math.cos(a)*u.z + Math.sin(a)*v.z),
+      }));
+    }
+    return pts;
+  }
+
+  // Rotate p toward unit dir by angle a (dir ⊥ to p)
+  function rotTo(p, dir, a) {
+    const cc = Math.cos(a), ss = Math.sin(a);
+    return {x: cc*p.x+ss*dir.x, y: cc*p.y+ss*dir.y, z: cc*p.z+ss*dir.z};
+  }
+
+  // Build multi-segment path through waypoints.
+  // cornAngles[j] = arc radius for wps[j+1] (j=0..N-3). 0 = pass-through joint.
+  function buildPath(wps, cornAngles) {
+    const N = wps.length;
+    const backs = [], fwds = [];
+    for (let j = 0; j < N-2; j++) {
+      const ca = cornAngles[j], wp = wps[j+1], prev = wps[j], nxt = wps[j+2];
+      if (ca < 0.001) { backs.push(wp); fwds.push(wp); continue; }
+      const a1 = Math.acos(Math.max(-1, Math.min(1, d3(prev, wp))));
+      const a2 = Math.acos(Math.max(-1, Math.min(1, d3(wp,   nxt))));
+      backs.push(slerp(prev, wp,  a1 > ca ? (a1-ca)/a1 : 0.02));
+      fwds.push( slerp(wp,  nxt,  a2 > ca ? ca/a2       : 0.98));
+    }
+    const pts = [];
+    for (let i = 0; i < N-1; i++) {
+      const sS = (i===0)   ? wps[0]   : fwds[i-1];
+      const sE = (i===N-2) ? wps[N-1] : backs[i];
+      const ang = Math.acos(Math.max(-1, Math.min(1, d3(sS, sE))));
+      const seg = geoArc(sS, sE, Math.max(3, Math.round(SEG_RATE * ang)));
+      if (i===0) pts.push(...seg); else pts.push(...seg.slice(1));
+      if (i < N-2 && cornAngles[i] >= 0.001) {
+        const prev = wps[i], wp = wps[i+1], nxt = wps[i+2];
+        const backPt = backs[i], fwdPt = fwds[i];
+        const ca = cornAngles[i];
+        const ds = d3(wp, prev);
+        const tI = n3({x:ds*wp.x-prev.x, y:ds*wp.y-prev.y, z:ds*wp.z-prev.z});
+        const de = d3(wp, nxt);
+        const tO = n3({x:nxt.x-de*wp.x,  y:nxt.y-de*wp.y,  z:nxt.z-de*wp.z});
+        const ts = d3(c3(tI, tO), wp);
+        const ti = n3({x:wp.x-d3(wp,backPt)*backPt.x, y:wp.y-d3(wp,backPt)*backPt.y, z:wp.z-d3(wp,backPt)*backPt.z});
+        const inw = ts >= 0 ? n3(c3(backPt, ti)) : n3(c3(ti, backPt));
+        const pole = n3({x:Math.cos(ca)*backPt.x+Math.sin(ca)*inw.x, y:Math.cos(ca)*backPt.y+Math.sin(ca)*inw.y, z:Math.cos(ca)*backPt.z+Math.sin(ca)*inw.z});
+        pts.push(...smallArc(pole, backPt, fwdPt, CORN_STEP).slice(1));
+      }
+    }
+    return pts;
+  }
+
+  // Build bundle-offset version: offset each waypoint, scale corner arcs for inner/outer lines
+  function buildOffsetPath(wps, cornAngles, delta) {
+    const N = wps.length;
+    const offWps = wps.map((wp, i) => {
+      let lat;
+      if (i === 0) {
+        const tOut = n3({x:wps[1].x-d3(wps[1],wp)*wp.x, y:wps[1].y-d3(wps[1],wp)*wp.y, z:wps[1].z-d3(wps[1],wp)*wp.z});
+        lat = n3(c3(wp, tOut));
+      } else if (i === N-1) {
+        const tIn = n3({x:d3(wp,wps[N-2])*wp.x-wps[N-2].x, y:d3(wp,wps[N-2])*wp.y-wps[N-2].y, z:d3(wp,wps[N-2])*wp.z-wps[N-2].z});
+        lat = n3(c3(wp, tIn));
+      } else {
+        const ds = d3(wp, wps[i-1]);
+        const tI = n3({x:ds*wp.x-wps[i-1].x, y:ds*wp.y-wps[i-1].y, z:ds*wp.z-wps[i-1].z});
+        const de = d3(wp, wps[i+1]);
+        const tO = n3({x:wps[i+1].x-de*wp.x, y:wps[i+1].y-de*wp.y, z:wps[i+1].z-de*wp.z});
+        const latI = n3(c3(wp, tI));
+        const latO = n3(c3(wp, tO));
+        const mv = {x:latI.x+latO.x, y:latI.y+latO.y, z:latI.z+latO.z};
+        const ml = Math.sqrt(mv.x*mv.x+mv.y*mv.y+mv.z*mv.z);
+        const md = ml > 1e-6 ? n3(mv) : latI;
+        const mf = ml > 0.3 ? Math.min(2.5, 2.0/ml) : 1.0;
+        return n3(rotTo(wp, md, delta*mf));
+      }
+      return n3(rotTo(wp, lat, delta));
+    });
+    const offCas = cornAngles.map((ca, j) => {
+      if (ca < 0.001) return 0;
+      const prev = wps[j], wp = wps[j+1], nxt = wps[j+2];
+      const ds = d3(wp, prev);
+      const tI = n3({x:ds*wp.x-prev.x, y:ds*wp.y-prev.y, z:ds*wp.z-prev.z});
+      const de = d3(wp, nxt);
+      const tO = n3({x:nxt.x-de*wp.x, y:nxt.y-de*wp.y, z:nxt.z-de*wp.z});
+      const ts = d3(c3(tI, tO), wp);
+      return Math.max(0.025, ca + delta * (ts >= 0 ? -1 : 1));
+    });
+    return buildPath(offWps, offCas);
+  }
+
+  // S-path: south edge → equator (turn) → wrap ≈315° → equator (turn) → north edge.
+  // eq1/eq2 split the equatorial arc into sub-arcs < π so geoArc takes the correct direction.
+  const phi = S.seed * (2 * Math.PI / 11);
+  const trunkWps = [
+    sph(phi,               Math.PI/2 + legV),   // start: south pole edge
+    sph(phi,               Math.PI/2),           // corner1: equator, first turn
+    sph(phi + wrapAng/3,   Math.PI/2),           // eq1: pass-through
+    sph(phi + 2*wrapAng/3, Math.PI/2),           // eq2: pass-through
+    sph(phi + wrapAng,     Math.PI/2),           // corner2: equator, second turn
+    sph(phi + wrapAng,     Math.PI/2 - legV),   // end: north pole edge
+  ];
+  const trunkCas = [cornAng, 0, 0, cornAng];
+
+  for (let li = 0; li < linesPerBundle; li++) {
+    const delta = (li - (linesPerBundle - 1) / 2) * angSpacing;
+    const pts3D = delta === 0
+      ? buildPath(trunkWps, trunkCas)
+      : buildOffsetPath(trunkWps, trunkCas, delta);
+    if (pts3D.length > 2) {
+      paths.push({ pts3D, off: rng() * UNIT * 4, sp: 0.15 + rng() * 0.15 });
+    }
+  }
+}
+
+// City: rectangular block grid on sphere with diagonal corridor clipping — mirrors flat mode
+function buildCitySphere(r, n) {
+  const seed = Math.floor(r() * 10000);
+  const rng    = mkRand(seed);
+  const offRng = mkRand(S.seed * 99991 + 7);
+
+  const t        = Math.max(0, Math.min(0.8, (n - 5) / 30));
+  const blockAng = 0.28 - t * 0.16;   // 0.28 → 0.12 rad per block
+  const roadAng  = 0.06 - t * 0.03;   // 0.06 → 0.03 rad per road
+  const cellAng  = blockAng + roadAng;
+
+  const thetaStart = 0.10;
+  const thetaEnd   = Math.PI - 0.10;
+  const numRows    = Math.max(2, Math.floor((thetaEnd - thetaStart) / cellAng));
+  const numCols    = Math.max(3, Math.floor(2 * Math.PI / cellAng));
+  const cellTheta  = (thetaEnd - thetaStart) / numRows;
+  const cellPhi    = 2 * Math.PI / numCols;
+  const blkTheta   = cellTheta * (blockAng / cellAng);
+  const blkPhi     = cellPhi   * (blockAng / cellAng);
+  const rdTheta    = cellTheta - blkTheta;
+  const rdPhi      = cellPhi   - blkPhi;
+
+  // Diagonal corridors — width matches roadAng (like flat roadWidth * 1.2)
+  const numDiag  = Math.round(S.seed / 10 * 4);
+  const corridors = [];
+  for (let d = 0; d < numDiag; d++) {
+    const phi  = rng() * 2 * Math.PI;
+    const cosT = (rng() * 2 - 1) * 0.65;
+    const sinT = Math.sqrt(Math.max(0, 1 - cosT * cosT));
+    corridors.push({ nx: sinT*Math.cos(phi), ny: sinT*Math.sin(phi), nz: cosT,
+                     hw: roadAng * 1.2 });  // narrow band, not cell-wide
+  }
+
+  // Spherical Sutherland-Hodgman half-plane clip.
+  // Keeps points where dot(p, n) >= threshold (i.e. on the "outside" half-sphere).
+  function clipSpherePoly(pts, nx, ny, nz, threshold) {
+    if (pts.length < 3) return [];
+    const out = [];
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i], b = pts[(i + 1) % pts.length];
+      const da = a.x*nx + a.y*ny + a.z*nz;
+      const db = b.x*nx + b.y*ny + b.z*nz;
+      if (da >= threshold) out.push(a);
+      if ((da > threshold && db < threshold) || (da < threshold && db > threshold)) {
+        const tc = (da - threshold) / (da - db);
+        const cx = a.x + (b.x - a.x) * tc;
+        const cy = a.y + (b.y - a.y) * tc;
+        const cz = a.z + (b.z - a.z) * tc;
+        const l  = Math.sqrt(cx*cx + cy*cy + cz*cz) || 1;
+        out.push({ x: cx/l, y: cy/l, z: cz/l });
+      }
+    }
+    return out;
+  }
+
+  // Clip a block polygon against all corridors; return surviving fragments (outside corridor bands).
+  function clipByCorridors3D(corners) {
+    let current = [corners];
+    for (const c of corridors) {
+      const sinHW = Math.sin(c.hw);
+      const next  = [];
+      for (const poly of current) {
+        // Left side of corridor band: dot(p, -n) >= sinHW  → dot(p, n) <= -sinHW
+        const left  = clipSpherePoly(poly, -c.nx, -c.ny, -c.nz, sinHW);
+        // Right side: dot(p, n) >= sinHW
+        const right = clipSpherePoly(poly,  c.nx,  c.ny,  c.nz, sinHW);
+        if (left.length  >= 3) next.push(left);
+        if (right.length >= 3) next.push(right);
+      }
+      if (next.length > 0) current = next;
+    }
+    return current;
+  }
+
+  // 3D unit-vector corners of a lat-lon block rectangle (4 corners, CCW order)
+  function blockCorners(th0, th1, ph0, ph1) {
+    return [
+      { x: Math.sin(th0)*Math.cos(ph0), y: Math.sin(th0)*Math.sin(ph0), z: Math.cos(th0) },
+      { x: Math.sin(th0)*Math.cos(ph1), y: Math.sin(th0)*Math.sin(ph1), z: Math.cos(th0) },
+      { x: Math.sin(th1)*Math.cos(ph1), y: Math.sin(th1)*Math.sin(ph1), z: Math.cos(th1) },
+      { x: Math.sin(th1)*Math.cos(ph0), y: Math.sin(th1)*Math.sin(ph0), z: Math.cos(th1) },
+    ];
+  }
+
+  // Convert a polygon of 3D corners to a dense closed pts3D path (geodesic arcs on each edge).
+  function polyToPath3D(corners) {
+    const pts3D = [];
+    for (let i = 0; i < corners.length; i++) {
+      const a = corners[i], b = corners[(i + 1) % corners.length];
+      const dot   = Math.max(-1, Math.min(1, a.x*b.x + a.y*b.y + a.z*b.z));
+      const ang   = Math.acos(dot);
+      const steps = Math.max(2, Math.ceil(ang / (cellAng / 8)));
+      const sinA  = ang > 0.001 ? Math.sin(ang) : 0;
+      const start = i === 0 ? 0 : 1;  // skip first point on subsequent edges (shared with prev)
+      for (let j = start; j <= steps; j++) {
+        const tt = j / steps;
+        if (sinA < 0.001) {
+          pts3D.push(tt < 0.5 ? { ...a } : { ...b });
+        } else {
+          const f0 = Math.sin((1-tt)*ang)/sinA, f1 = Math.sin(tt*ang)/sinA;
+          pts3D.push({ x: f0*a.x+f1*b.x, y: f0*a.y+f1*b.y, z: f0*a.z+f1*b.z });
+        }
+      }
+    }
+    if (pts3D.length > 0) pts3D.push({ ...pts3D[0] });  // close loop
+    return pts3D;
+  }
+
+  for (let row = 0; row < numRows; row++) {
+    for (let col = 0; col < numCols; col++) {
+      const th0 = thetaStart + row * cellTheta + rdTheta * 0.5;
+      const th1 = th0 + blkTheta;
+      const ph0 = col * cellPhi + rdPhi * 0.5;
+      const ph1 = ph0 + blkPhi;
+
+      const corners   = blockCorners(th0, th1, ph0, ph1);
+      const fragments = clipByCorridors3D(corners);
+
+      for (const frag of fragments) {
+        if (frag.length < 3) continue;
+        // Skip fragments smaller than half a road width
+        let minDot = 1;
+        for (let i = 0; i < frag.length; i++)
+          for (let j = i + 1; j < frag.length; j++) {
+            const d = frag[i].x*frag[j].x + frag[i].y*frag[j].y + frag[i].z*frag[j].z;
+            if (d < minDot) minDot = d;
+          }
+        if (Math.acos(Math.max(-1, Math.min(1, minDot))) < roadAng * 0.8) continue;
+
+        const pts3D = polyToPath3D(frag);
+        if (pts3D.length > 4)
+          paths.push({ pts3D, off: offRng() * UNIT * 2, sp: 0.15 + offRng() * 0.15 });
+      }
+    }
+  }
+}
+
+// Networks: seeded random Poisson-disk scatter + K-nearest geodesic arcs
+// Each seed produces genuinely different node topology (not just a rotation of the same graph)
+function buildNetworksSphere(r, n) {
+  const nc     = Math.max(20, Math.floor(18 + n * 1.25));
+  const offRng = mkRand(S.seed * 99991 + 7);
+
+  // Fibonacci sphere base: perfectly uniform coverage, guaranteed no holes.
+  // Per-node seed-based perturbation shifts each node slightly so every seed
+  // produces a distinct topology while maintaining even distribution.
+  const phi0    = (1 + Math.sqrt(5)) / 2;
+  const nodes3D = [];
+  for (let i = 0; i < nc; i++) {
+    const phi      = 2 * Math.PI * i / phi0;
+    const cosTheta = 1 - 2 * (i + 0.5) / nc;
+    const sinTheta = Math.sqrt(Math.max(0, 1 - cosTheta * cosTheta));
+    nodes3D.push({ x: sinTheta*Math.cos(phi), y: sinTheta*Math.sin(phi), z: cosTheta });
+  }
+
+  // Per-node perturbation: rotate each node by a small seed-dependent angle
+  // in a random tangent-plane direction. Max offset = 30% of average node spacing.
+  const rng2       = mkRand(S.seed * 7907 + 3);
+  const perturbAng = Math.sqrt(4 * Math.PI / nc) * 0.30;
+  for (let i = 0; i < nodes3D.length; i++) {
+    const p       = nodes3D[i];
+    const randPhi = rng2() * 2 * Math.PI;
+    const offset  = rng2() * perturbAng;
+    // Build an orthonormal tangent frame at p
+    const refX = Math.abs(p.z) < 0.9 ? 1 : 0, refY = Math.abs(p.z) < 0.9 ? 0 : 1;
+    const d1   = refX*p.x + refY*p.y;              // dot(ref, p)
+    let t1x = refX - d1*p.x, t1y = refY - d1*p.y, t1z = -d1*p.z;
+    const t1l = Math.sqrt(t1x*t1x + t1y*t1y + t1z*t1z) || 1;
+    t1x/=t1l; t1y/=t1l; t1z/=t1l;
+    const t2x = p.y*t1z - p.z*t1y, t2y = p.z*t1x - p.x*t1z, t2z = p.x*t1y - p.y*t1x;
+    // Displacement direction in tangent plane
+    const dx = Math.cos(randPhi)*t1x + Math.sin(randPhi)*t2x;
+    const dy = Math.cos(randPhi)*t1y + Math.sin(randPhi)*t2y;
+    const dz = Math.cos(randPhi)*t1z + Math.sin(randPhi)*t2z;
+    // Rotate p by `offset` radians toward (dx,dy,dz)
+    const cosO = Math.cos(offset), sinO = Math.sin(offset);
+    const nx = cosO*p.x + sinO*dx, ny = cosO*p.y + sinO*dy, nz = cosO*p.z + sinO*dz;
+    const l  = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
+    nodes3D[i] = { x: nx/l, y: ny/l, z: nz/l };
+  }
+
+  // Connect each node to its K nearest neighbours via geodesic arcs
+  const K = 5, edgeSet = new Set();
+  for (let i = 0; i < nodes3D.length; i++) {
+    const p0 = nodes3D[i];
+    const nbrs = nodes3D
+      .map((p1, j) => ({ j, d: Math.acos(Math.max(-1, Math.min(1, p0.x*p1.x + p0.y*p1.y + p0.z*p1.z))) }))
+      .filter(e => e.j !== i).sort((a, b) => a.d - b.d).slice(0, K);
+
+    for (const { j, d: angle } of nbrs) {
+      const key = i < j ? `${i}-${j}` : `${j}-${i}`;
+      if (edgeSet.has(key)) continue;
+      edgeSet.add(key);
+      const p1 = nodes3D[j];
+      const ARC_STEPS = Math.max(3, Math.ceil(angle * 18));
+      const pts3D = [];
+      if (angle < 0.001) {
+        pts3D.push({ ...p0 }, { ...p1 });
+      } else {
+        const sinA = Math.sin(angle);
+        for (let si = 0; si <= ARC_STEPS; si++) {
+          const tt = si / ARC_STEPS;
+          const f0 = Math.sin((1-tt)*angle)/sinA, f1 = Math.sin(tt*angle)/sinA;
+          pts3D.push({ x: f0*p0.x+f1*p1.x, y: f0*p0.y+f1*p1.y, z: f0*p0.z+f1*p1.z });
+        }
+      }
+      paths.push({ pts3D, off: offRng() * UNIT * 2, sp: 0.15 + offRng() * 0.15, rigid: true });
+    }
+  }
+  S.networkNodes3D = nodes3D;
+}
+
+// Draw dot-bar units along a 2D path using sphere projection for Spatial 3.
+// Arc-length parameterization on the ORIGINAL 2D path ensures animation speed
+// is uniform — the dot advance rate is constant in canvas-space, so there are
+// no speed jumps as the sphere rotates or path segments appear/disappear.
+function drawUnitsOnSphere(ctx, srcPts, off, color, rotAngle) {
+  if (srcPts.length < 2) return;
+  // Cumulative arc lengths along original 2D path
+  const dists = [0];
+  for (let i = 1; i < srcPts.length; i++)
+    dists.push(dists[i-1] + Math.hypot(srcPts[i].x-srcPts[i-1].x, srcPts[i].y-srcPts[i-1].y));
+  const totalLen = dists[dists.length-1];
+  if (totalLen < 1) return;
+
+  // 2D canvas point at arc-length d
+  function pt2dAtD(d) {
+    d = Math.max(0, Math.min(totalLen, d));
+    let lo = 0, hi = dists.length - 1;
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (dists[mid] <= d) lo = mid; else hi = mid; }
+    const t = dists[hi] > dists[lo] ? (d - dists[lo]) / (dists[hi] - dists[lo]) : 0;
+    return { x: srcPts[lo].x + (srcPts[hi].x - srcPts[lo].x) * t,
+             y: srcPts[lo].y + (srcPts[hi].y - srcPts[lo].y) * t };
+  }
+
+  ctx.fillStyle = color;
+  for (let d = -(off % UNIT); d < totalLen; d += UNIT) {
+    // ── Circle ──────────────────────────────────────────────────────
+    const cD = d + CR;
+    if (cD >= 0 && cD <= totalLen) {
+      const p2d = pt2dAtD(cD);
+      const pp = sphereProject(p2d.x, p2d.y, rotAngle);
+      if (pp) { ctx.beginPath(); ctx.arc(pp.x, pp.y, CR, 0, Math.PI * 2); ctx.fill(); }
+    }
+    // ── Bar — sample arc positions, project each, draw ribbon ───────
+    const bStart = d + CR * 2 + GAP, bEnd = bStart + BW;
+    if (bEnd >= 0 && bStart <= totalLen) {
+      const cs = Math.max(0, bStart), ce = Math.min(totalLen, bEnd);
+      const steps = Math.max(2, Math.ceil((ce - cs) / 5));
+      const ppPts = [];
+      for (let si = 0; si <= steps; si++) {
+        const p2d = pt2dAtD(cs + (ce - cs) * si / steps);
+        const pp = sphereProject(p2d.x, p2d.y, rotAngle);
+        if (pp) ppPts.push(pp);
+        else if (ppPts.length > 0) break; // hit back hemisphere — stop bar here
+      }
+      if (ppPts.length >= 2) {
+        const top = [], bot = [];
+        for (let si = 0; si < ppPts.length; si++) {
+          const prev = ppPts[Math.max(0, si - 1)];
+          const next = ppPts[Math.min(ppPts.length - 1, si + 1)];
+          const angle = Math.atan2(next.y - prev.y, next.x - prev.x);
+          const nx = -Math.sin(angle), ny = Math.cos(angle);
+          top.push({ x: ppPts[si].x + nx * BH/2, y: ppPts[si].y + ny * BH/2 });
+          bot.push({ x: ppPts[si].x - nx * BH/2, y: ppPts[si].y - ny * BH/2 });
+        }
+        ctx.beginPath();
+        ctx.moveTo(top[0].x, top[0].y);
+        for (let si = 1; si < top.length; si++) ctx.lineTo(top[si].x, top[si].y);
+        for (let si = top.length - 1; si >= 0; si--) ctx.lineTo(bot[si].x, bot[si].y);
+        ctx.closePath(); ctx.fill();
+      }
+    }
+  }
+}
+
+// Project a 3D unit-sphere point to screen via rotation + orthographic camera.
+// Rotation is around the world Z axis (globe spin). Returns null for back hemisphere.
+function project3D(p3, rotAngle) {
+  const cos_r = Math.cos(rotAngle), sin_r = Math.sin(rotAngle);
+  const xr = p3.x * cos_r - p3.y * sin_r;
+  const yr = p3.x * sin_r + p3.y * cos_r;
+  const zr = p3.z;
+  if (xr <= 0.02) return null;
+  const SR = Math.min(W, H) * 0.44;
+  return { x: W * 0.5 + yr * SR, y: H * 0.5 - zr * SR };
+}
+
+// Draw dot-bar units along a native 3D sphere path (pts3D = [{x,y,z}] unit vectors).
+// Arc lengths are scaled by SR to screen-pixel equivalents for speed parity with flat mode.
+function drawUnitsOnSphere3D(ctx, pts3D, off, color, rotAngle) {
+  if (pts3D.length < 2) return;
+  const SR = Math.min(W, H) * 0.44;
+  const dists = [0];
+  for (let i = 1; i < pts3D.length; i++) {
+    const dx = pts3D[i].x - pts3D[i-1].x, dy = pts3D[i].y - pts3D[i-1].y, dz = pts3D[i].z - pts3D[i-1].z;
+    dists.push(dists[i-1] + Math.sqrt(dx*dx + dy*dy + dz*dz) * SR);
+  }
+  const totalLen = dists[dists.length-1];
+  if (totalLen < 1) return;
+
+  function pt3DAtD(d) {
+    d = Math.max(0, Math.min(totalLen, d));
+    let lo = 0, hi = dists.length - 1;
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (dists[mid] <= d) lo = mid; else hi = mid; }
+    const t = dists[hi] > dists[lo] ? (d - dists[lo]) / (dists[hi] - dists[lo]) : 0;
+    return { x: pts3D[lo].x + (pts3D[hi].x - pts3D[lo].x) * t,
+             y: pts3D[lo].y + (pts3D[hi].y - pts3D[lo].y) * t,
+             z: pts3D[lo].z + (pts3D[hi].z - pts3D[lo].z) * t };
+  }
+
+  ctx.fillStyle = color;
+  for (let d = -(off % UNIT); d < totalLen; d += UNIT) {
+    const cD = d + CR;
+    if (cD >= 0 && cD <= totalLen) {
+      const pp = project3D(pt3DAtD(cD), rotAngle);
+      if (pp) { ctx.beginPath(); ctx.arc(pp.x, pp.y, CR, 0, Math.PI * 2); ctx.fill(); }
+    }
+    const bStart = d + CR * 2 + GAP, bEnd = bStart + BW;
+    if (bEnd >= 0 && bStart <= totalLen) {
+      const cs = Math.max(0, bStart), ce = Math.min(totalLen, bEnd);
+      const steps = Math.max(2, Math.ceil((ce - cs) / 5));
+      const ppPts = [];
+      for (let si = 0; si <= steps; si++) {
+        const pp = project3D(pt3DAtD(cs + (ce - cs) * si / steps), rotAngle);
+        if (pp) ppPts.push(pp);
+        else if (ppPts.length > 0) break;
+      }
+      if (ppPts.length >= 2) {
+        const top = [], bot = [];
+        for (let si = 0; si < ppPts.length; si++) {
+          const prev = ppPts[Math.max(0, si-1)], next = ppPts[Math.min(ppPts.length-1, si+1)];
+          const ang = Math.atan2(next.y - prev.y, next.x - prev.x);
+          const nx = -Math.sin(ang), ny = Math.cos(ang);
+          top.push({ x: ppPts[si].x + nx*BH/2, y: ppPts[si].y + ny*BH/2 });
+          bot.push({ x: ppPts[si].x - nx*BH/2, y: ppPts[si].y - ny*BH/2 });
+        }
+        ctx.beginPath();
+        ctx.moveTo(top[0].x, top[0].y);
+        for (let si = 1; si < top.length; si++) ctx.lineTo(top[si].x, top[si].y);
+        for (let si = top.length - 1; si >= 0; si--) ctx.lineTo(bot[si].x, bot[si].y);
+        ctx.closePath(); ctx.fill();
+      }
     }
   }
 }
@@ -2002,28 +2471,30 @@ function deformPath(p, drift) {
  * Main render loop: animate and draw all pattern paths
  * Handles path flattening with interaction deformation
  */
-// ── Sphere projection for Spatial 4 ──────────────────────────────────────────
+// ── Sphere projection for Spatial 3 ──────────────────────────────────────────
 // Maps a flat canvas point (x, y) onto a rotating globe using equirectangular
 // projection and orthographic camera along the +X axis.
-// Returns {x, y} screen position, or null if the point is on the back hemisphere.
+// X wraps periodically ([0,W] = one full longitude period) — bleed-area points
+// tile seamlessly onto the sphere surface without seam artifacts.
+// Y is clipped to [0,H] — latitude is NOT circular (poles at top and bottom),
+// so wrapping Y would map top-bleed points to wrong latitudes.
+// Returns {x, y} screen position, or null if back-hemisphere or out of y range.
 function sphereProject(x, y, rotAngle) {
+  if (y < 0 || y > H) return null;            // latitude axis — clip, do not wrap
   const scx = W * 0.5, scy = H * 0.5;
   const SR  = Math.min(W, H) * 0.44;
-  // Flat coords → equirectangular spherical angles
-  const lon = (x / W - 0.5) * 2 * Math.PI;       // longitude [-π, π]
-  const lat = (0.5 - y / H) * Math.PI * 0.78;    // latitude  [±70°] — avoids polar convergence jumble
-  // Spherical → unit-sphere Cartesian
+  const wx  = ((x % W) + W) % W;              // longitude axis — wrap seamlessly
+  const lon = (wx / W - 0.5) * 2 * Math.PI;  // [-π, π]
+  const lat = (0.5 - y / H) * Math.PI * 0.99; // [±89°] — full sphere coverage, no polar cap
   const cosLat = Math.cos(lat);
   const x3 = cosLat * Math.cos(lon);
   const y3 = cosLat * Math.sin(lon);
   const z3 = Math.sin(lat);
-  // Rotate globe around polar (Z) axis
   const cos_r = Math.cos(rotAngle), sin_r = Math.sin(rotAngle);
   const xr = x3 * cos_r - y3 * sin_r;
   const yr = x3 * sin_r + y3 * cos_r;
   const zr = z3;
-  // Orthographic projection — camera at +X; only front hemisphere visible
-  if (xr <= 0.01) return null;
+  if (xr <= 0.02) return null;
   return { x: scx + yr * SR, y: scy - zr * SR };
 }
 
@@ -2072,36 +2543,28 @@ function draw(ts = performance.now()) {
 
   // ── Draw paths + nodes ────────────────────────────────────────────
   if (S.movement === 'spatial3') {
-    // ── Spatial 3: sphere globe projection ───────────────────────────
-    // Pattern wraps around a rotating sphere. Each point is mapped through
-    // equirectangular → 3D sphere → orthographic projection to the screen.
-    // Points on the back hemisphere are invisible (path segment clipped).
-    const s4rot = S.spatialX;  // one full rotation per 10s cycle
+    // ── Spatial 3: sphere-native geometry — no equirectangular projection ──
+    // All paths built natively on the unit sphere (pts3D arrays).
+    const s4rot = S.spatialX;
     const SR = Math.min(W, H) * 0.44;
 
-    // Clip all drawing to the sphere circle
     cx.save();
     cx.beginPath();
     cx.arc(W * 0.5, H * 0.5, SR, 0, Math.PI * 2);
     cx.clip();
 
     for (const p of paths) {
-      if (p.screenFixed) continue;
-      // Get dense path points — use pre-flattened if available, else flatten pts
-      const srcPts = p.flat ? p.flat : (p.pts && p.pts.length > 1 ? flattenPath(p.pts) : null);
-      if (!srcPts || srcPts.length < 2) continue;
-      // Project each point through sphere; split segments at hemisphere boundary
-      let seg = [];
-      for (const pt of srcPts) {
-        const pp = sphereProject(pt.x, pt.y, s4rot);
-        if (pp) {
-          seg.push(pp);
-        } else {
-          if (seg.length > 2) drawUnits(cx, flattenPath(seg), p.off, S.lineColor);
-          seg = [];
-        }
+      if (!p.pts3D || p.pts3D.length < 2) continue;
+      drawUnitsOnSphere3D(cx, p.pts3D, p.off, S.lineColor, s4rot);
+    }
+
+    // Network node dots — projected from native 3D positions
+    if (S.pattern === 'networks' && S.networkNodes3D) {
+      cx.fillStyle = S.lineColor;
+      for (const nd of S.networkNodes3D) {
+        const pp = project3D(nd, s4rot);
+        if (pp) { cx.beginPath(); cx.arc(pp.x, pp.y, CR, 0, Math.PI * 2); cx.fill(); }
       }
-      if (seg.length > 2) drawUnits(cx, flattenPath(seg), p.off, S.lineColor);
     }
 
     cx.restore();
@@ -2149,7 +2612,9 @@ function draw(ts = performance.now()) {
             if (pt.y < fMinY) fMinY = pt.y; if (pt.y > fMaxY) fMaxY = pt.y;
           }
           if (fMaxX - fMinX < MIN_BLK || fMaxY - fMinY < MIN_BLK) continue;
-          const ring = [...frag, frag[0]];
+          // Chamfer corners before sampling so flattenPath rounds them into smooth arcs
+          const chamfered = chamferPoly(frag, p.blockRoadW * 0.55);
+          const ring = [...chamfered, chamfered[0]];
           const fragPts = [];
           for (let i = 0; i < ring.length - 1; i++) {
             const a = ring[i], b = ring[i + 1];
@@ -2166,7 +2631,10 @@ function draw(ts = performance.now()) {
         continue;
       }
 
-      if (p.flat) {
+      // Use pre-computed flat when available (e.g. terrain), UNLESS terrain has shapes —
+      // in that case deformPath must run to split paths at shape boundaries (uses p.pts).
+      const needsDeform = S.pattern === 'terrain' && S.shapes.length > 0;
+      if (p.flat && !needsDeform) {
         drawUnits(cx, p.flat, p.off, S.lineColor);
       } else {
         const subs = deformPath(p, drift);
@@ -2268,97 +2736,12 @@ let lastDrawTime = 0;
 // ================================================================
 // CANVAS INTERACTION
 // ================================================================
-const cursorRing = document.getElementById('cursor-ring');
-let shapeDrag = null;   // null | {type:'body'|'handle', idx, corner, startMx, startMy, startX, startY, startW, startH}
-
 cv.addEventListener('mousemove', e => {
   const r = cv.getBoundingClientRect();
   S.mx = e.clientX - r.left; S.my = e.clientY - r.top;
-  cursorRing.style.left = S.mx+'px'; cursorRing.style.top = S.my+'px';
-
-  // Update cursor style based on what's under the mouse
-  if (!shapeDrag && S.mode === 'active' && S.shapes.length > 0) {
-    const hit = hitTestShapes(S.mx, S.my);
-    if (hit) {
-      cv.style.cursor = hit.type === 'handle' ? 'nwse-resize' : 'move';
-    } else {
-      cv.style.cursor = 'crosshair';
-    }
-  } else if (!shapeDrag) {
-    cv.style.cursor = '';
-  }
-
-  if (!shapeDrag) return;
-  const dx = S.mx - shapeDrag.startMx, dy = S.my - shapeDrag.startMy;
-  const sh = S.shapes[shapeDrag.idx];
-  const MIN_W = 40, MIN_H = 30;
-
-  if (shapeDrag.type === 'body') {
-    sh.x = shapeDrag.startX + dx;
-    sh.y = shapeDrag.startY + dy;
-  } else {
-    const c = shapeDrag.corner;
-    if (c === 'tl') {
-      sh.x = Math.min(shapeDrag.startX + dx, shapeDrag.startX + shapeDrag.startW - MIN_W);
-      sh.y = Math.min(shapeDrag.startY + dy, shapeDrag.startY + shapeDrag.startH - MIN_H);
-      sh.w = shapeDrag.startW - (sh.x - shapeDrag.startX);
-      sh.h = shapeDrag.startH - (sh.y - shapeDrag.startY);
-    } else if (c === 'tr') {
-      sh.y = Math.min(shapeDrag.startY + dy, shapeDrag.startY + shapeDrag.startH - MIN_H);
-      sh.w = Math.max(MIN_W, shapeDrag.startW + dx);
-      sh.h = shapeDrag.startH - (sh.y - shapeDrag.startY);
-    } else if (c === 'bl') {
-      sh.x = Math.min(shapeDrag.startX + dx, shapeDrag.startX + shapeDrag.startW - MIN_W);
-      sh.w = shapeDrag.startW - (sh.x - shapeDrag.startX);
-      sh.h = Math.max(MIN_H, shapeDrag.startH + dy);
-    } else { // br
-      sh.w = Math.max(MIN_W, shapeDrag.startW + dx);
-      sh.h = Math.max(MIN_H, shapeDrag.startH + dy);
-    }
-  }
-  // Rectangle repulsion is applied per-frame via repulse() — no rebuild needed during drag.
 });
 
 cv.addEventListener('mouseleave', () => { S.mx=-9999; S.my=-9999; });
-
-cv.addEventListener('mousedown', e => {
-  if (S.mode !== 'active') return;
-  const r = cv.getBoundingClientRect();
-  const mx = e.clientX - r.left, my = e.clientY - r.top;
-
-  const hit = hitTestShapes(mx, my);
-  if (hit) {
-    const sh = S.shapes[hit.idx];
-    shapeDrag = { ...hit, startMx: mx, startMy: my, startX: sh.x, startY: sh.y, startW: sh.w, startH: sh.h };
-    e.preventDefault();
-  }
-  // Click-to-place is handled by the toolbar button
-});
-
-cv.addEventListener('mouseup', () => {
-  if (shapeDrag) {
-    shapeDrag = null;
-    clearTimeout(rebuildTimer);
-    rebuild(); // Bake final rect position into city/network geometry
-  }
-});
-
-document.getElementById('addRectBtn').addEventListener('click', () => {
-  if (S.shapes.length >= 3) { toast('Maximum 3 rectangles'); return; }
-  // Place rectangle in a staggered position near center
-  const idx = S.shapes.length;
-  const W0 = 200, H0 = 130;
-  const offsets = [{dx:0,dy:0},{dx:80,dy:60},{dx:-70,dy:80}];
-  const cx0 = W * 0.5 + offsets[idx].dx, cy0 = H * 0.5 + offsets[idx].dy;
-  S.shapes.push({ x: cx0 - W0/2, y: cy0 - H0/2, w: W0, h: H0 });
-  rebuild();
-});
-
-document.getElementById('clrBtn').addEventListener('click', () => {
-  S.shapes = [];
-  shapeDrag = null;
-  rebuild();
-});
 
 // ================================================================
 // MENU TOGGLE (panel open/close — Art of Noise style)
@@ -2499,18 +2882,6 @@ function exclusive(aId, bId, onA, onB) {
   b.addEventListener('click', () => { b.classList.add('is-active'); a.classList.remove('is-active'); onB(); });
 }
 
-exclusive('mActive','mPassive',
-  () => {
-    // Spatial 3 (sphere) is passive-only — block switching to interactive
-    if (S.movement === 'spatial3') {
-      document.getElementById('mActive').classList.remove('is-active');
-      document.getElementById('mPassive').classList.add('is-active');
-      return;
-    }
-    S.mode='active';  stage.classList.add('active-mode');    document.getElementById('shape-toolbar').classList.add('visible');
-  },
-  () => { S.mode='passive'; stage.classList.remove('active-mode'); document.getElementById('shape-toolbar').classList.remove('visible'); }
-);
 document.getElementById('mMotion').addEventListener('click', () => {
   S.motionOn = !S.motionOn;
   document.getElementById('mMotion').classList.toggle('is-active', S.motionOn);
@@ -2522,14 +2893,13 @@ movementIds.forEach(id => {
   document.getElementById(id).addEventListener('click', () => {
     movementIds.forEach(i => document.getElementById(i).classList.remove('is-active'));
     document.getElementById(id).classList.add('is-active');
+    const prevMovement = S.movement;
     S.movement = movementVals[id];
     S.spatialX = 0; S.driftY = 0;
-    // Spatial 3 (sphere): clear all interactive elements and force passive mode
-    if (S.movement === 'spatial3') {
-      S.shapes = [];
-      S.networkNodes = null;
+    // Rebuild whenever entering or leaving spatial3 — geometry is fundamentally different
+    if (S.movement === 'spatial3' || prevMovement === 'spatial3') {
+      S.networkNodes = null; S.networkNodes3D = null;
       rebuild();
-      if (S.mode === 'active') document.getElementById('mPassive').click();
     }
   });
 });
@@ -2556,8 +2926,8 @@ setupSlider('densityRange', 'densityBadge', false, v => { S.density = v; rebuild
 setupSlider('seedRange',    'seedBadge',    true,  v => { S.seed = v; rebuildWithTransition(); });
 
 document.getElementById('resetBtn').addEventListener('click', () => {
-  // Reset only sliders/shapes — motion mode, spatial state preserved
-  S.speed=.5; S.density=.5; S.seed=5; S.shapes=[]; shapeDrag=null;
+  // Reset only sliders — motion mode, spatial state preserved
+  S.speed=.5; S.density=.5; S.seed=5;
   document.getElementById('speedRange').value   = 50;
   document.getElementById('densityRange').value = 50;
   document.getElementById('seedRange').value    = 5;
@@ -2691,7 +3061,8 @@ function drawExportPaths(ctx, drift) {
           if (pt.y<minY) minY=pt.y; if (pt.y>maxY) maxY=pt.y;
         }
         if (maxX-minX < MIN_BLK || maxY-minY < MIN_BLK) continue;
-        const ring = [...frag, frag[0]];
+        const chamfered = chamferPoly(frag, p.blockRoadW * 0.55);
+        const ring = [...chamfered, chamfered[0]];
         const pts = [];
         for (let i=0; i<ring.length-1; i++) {
           const a=ring[i], b=ring[i+1];
@@ -2717,18 +3088,15 @@ function drawExportSphere(ctx, rotAngle) {
   ctx.arc(W * 0.5, H * 0.5, SR, 0, Math.PI * 2);
   ctx.clip();
   for (const p of paths) {
-    if (p.screenFixed) continue;
-    const srcPts = p.flat ? p.flat : (p.pts && p.pts.length > 1 ? flattenPath(p.pts) : null);
-    if (!srcPts || srcPts.length < 2) continue;
-    let seg = [];
-    for (const pt of srcPts) {
-      const pp = sphereProject(pt.x, pt.y, rotAngle);
-      if (pp) { seg.push(pp); } else {
-        if (seg.length > 2) drawUnits(ctx, flattenPath(seg), p.off, S.lineColor);
-        seg = [];
-      }
+    if (!p.pts3D || p.pts3D.length < 2) continue;
+    drawUnitsOnSphere3D(ctx, p.pts3D, p.off, S.lineColor, rotAngle);
+  }
+  if (S.pattern === 'networks' && S.networkNodes3D) {
+    ctx.fillStyle = S.lineColor;
+    for (const nd of S.networkNodes3D) {
+      const pp = project3D(nd, rotAngle);
+      if (pp) { ctx.beginPath(); ctx.arc(pp.x, pp.y, CR, 0, Math.PI * 2); ctx.fill(); }
     }
-    if (seg.length > 2) drawUnits(ctx, flattenPath(seg), p.off, S.lineColor);
   }
   ctx.restore();
 }
@@ -2739,7 +3107,7 @@ function renderPatternToCanvas(ew, eh) {
   const sx = ew / W, sy = eh / H;
 
   if (S.movement === 'spatial3') {
-    // Sphere export: capture current rotation snapshot
+    // Sphere export: transparent background (PNG), bg added by JPG handler separately
     tx.save(); tx.scale(sx, sy);
     drawExportSphere(tx, S.spatialX);
     tx.restore();
@@ -2817,14 +3185,7 @@ document.getElementById('exSvg').addEventListener('click', () => {
     const dists = [0];
     for (let i=1;i<flat.length;i++) dists.push(dists[i-1]+Math.hypot(flat[i].x-flat[i-1].x,flat[i].y-flat[i-1].y));
     const totalLen = dists[dists.length-1];
-    const atDFn = d => {
-      d=Math.max(0,Math.min(totalLen,d));
-      let lo=0,hi=dists.length-1;
-      while(hi-lo>1){const mid=(lo+hi)>>1;if(dists[mid]<=d)lo=mid;else hi=mid;}
-      const segLen=dists[hi]-dists[lo],t=segLen>0?(d-dists[lo])/segLen:0;
-      return{x:flat[lo].x+(flat[hi].x-flat[lo].x)*t,y:flat[lo].y+(flat[hi].y-flat[lo].y)*t,
-             angle:Math.atan2(flat[hi].y-flat[lo].y,flat[hi].x-flat[lo].x)};
-    };
+    const atDFn = d => pointAtDistance(flat, dists, totalLen, d);
     for (let d=-(p.off%UNIT);d<totalLen;d+=UNIT) {
       // Circle unit
       const cD=d+CR;
@@ -2873,11 +3234,12 @@ document.getElementById('exVideo').addEventListener('click', () => {
                : (S.movement === 'spatial' || S.movement === 'spatial2') ? 300 : 150;
   const SPATIAL_STEP = (2 * Math.PI) / FRAMES;
   const sm = 0.5 + S.speed * 3;
-  const saved = paths.map(p => p.off);
+  const savedOff = paths.map(p => p.off);
 
-  paths.forEach(p => {
+  // Pre-compute per-path loop speeds without mutating path objects
+  const loopState = paths.map(p => {
     const adv = FRAMES * p.sp * sm * 0.4, loops = Math.round(adv / UNIT) || 1;
-    p._ls = (loops * UNIT) / (FRAMES * sm * 0.4); p._s0 = 0; p.off = 0;
+    return (loops * UNIT) / (FRAMES * sm * 0.4);
   });
 
   // Pick best supported H.264 MP4 mime type
@@ -2899,7 +3261,7 @@ document.getElementById('exVideo').addEventListener('click', () => {
   cancelAnimationFrame(animId);
 
   function cleanup() {
-    paths.forEach((p, i) => { p.off = saved[i]; delete p._ls; delete p._s0; });
+    paths.forEach((p, i) => { p.off = savedOff[i]; });
     S.recording = false; btn.classList.remove('is-recording');
     btn.textContent = 'Animation';
     prog.style.display = 'none'; bar.style.width = '0%';
@@ -2975,7 +3337,7 @@ document.getElementById('exVideo').addEventListener('click', () => {
     if (lastFrameTime === null) lastFrameTime = now;
     if (now - lastFrameTime >= MS_PER_FRAME - 1) {
       lastFrameTime += MS_PER_FRAME;  // advance by fixed step to avoid drift
-      paths.forEach(p => { p.off = p._s0 + f * (p._ls || p.sp) * sm * 0.4; });
+      paths.forEach((p, i) => { p.off = f * loopState[i] * sm * 0.4; });
       const drift  = S.movement === 'spatial'  ? Math.sin(f * SPATIAL_STEP) * 120
                    : S.movement === 'spatial2' ? Math.sin(f * SPATIAL_STEP) * 85 : 0;
       const driftY = S.movement === 'spatial2' ? Math.sin(f * SPATIAL_STEP * 2) * 50 : 0;
@@ -3000,12 +3362,6 @@ document.getElementById('exVideo').addEventListener('click', () => {
 // ================================================================
 (function initDefaults() {
   applyTheme('light', false);
-  // Start in passive mode — interactive mode must be explicitly chosen by the user
-  S.mode = 'passive';
-  stage.classList.remove('active-mode');
-  document.getElementById('shape-toolbar').classList.remove('visible');
-  document.getElementById('mPassive').classList.add('is-active');
-  document.getElementById('mActive').classList.remove('is-active');
 })();
 
 resize();
