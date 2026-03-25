@@ -1119,17 +1119,22 @@ function buildPathways(r, n) {
 function rebuild() {
   const r = mkRand(S.seed * 7919 + 13);
   paths = []; S.networkNodes = null; S.networkNodes3D = null;
-  const n = Math.floor(5 + S.density * 30);
+  const d = S.density;
   if (S.movement === 'spatial3') {
-    if      (S.pattern === 'pathways') buildPathwaysSphere(r, n);
-    else if (S.pattern === 'terrain')  buildTerrainSphere(r, n);
-    else if (S.pattern === 'city')     buildCitySphere(r, n);
-    else                               buildNetworksSphere(r, n);
+    // Terrain sphere: current 0% visual → 40% slider. Remap [0.4,1]→[0,1], below 0.4 = minimum.
+    // Network sphere: old 100% at 50% slider, continues increasing beyond.
+    // City sphere: scaled down to match flat version visual weight.
+    if      (S.pattern === 'pathways') buildPathwaysSphere(r, Math.floor(5 + d * 30));
+    else if (S.pattern === 'terrain')  buildTerrainSphere(r, Math.floor(5 + Math.max(0, d - 0.4) / 0.6 * 30));
+    else if (S.pattern === 'city')     buildCitySphere(r, Math.floor(5 + d * 30));
+    else                               buildNetworksSphere(r, Math.floor(5 + d * 2 * 30));
   } else {
-    if      (S.pattern === 'pathways') buildPathways(r, n);
-    else if (S.pattern === 'terrain')  buildTerrain(r, n);
-    else if (S.pattern === 'city')     buildCity(r, n);
-    else                               buildNetworks(r, n);
+    // Terrain flat: current 30% visual → 50% slider. Scale down: d*0.6.
+    // Network flat: old 100% at 50% slider, continues increasing beyond.
+    if      (S.pattern === 'pathways') buildPathways(r, Math.floor(5 + d * 30));
+    else if (S.pattern === 'terrain')  buildTerrain(r, Math.floor(5 + d * 0.6 * 30));
+    else if (S.pattern === 'city')     buildCity(r, Math.floor(5 + d * 30));
+    else                               buildNetworks(r, Math.floor(5 + d * 2 * 30));
   }
 }
 
@@ -1918,168 +1923,204 @@ function buildTerrainSphere(r, n) {
 // Two trunk sets (front + back hemisphere) ensure paths are visible throughout the full rotation.
 function buildPathwaysSphere(r, n) {
   const rng            = mkRand(Math.floor(r() * 10000));
-  const linesPerBundle = Math.max(6, Math.floor(6 + n * 0.27));
-  const angSpacing     = 0.038;   // angular gap between parallel lines
-  const legV           = 1.3;     // vertical arm from equator to pole edge (≈74°)
-  const wrapAng        = 5.5;     // equatorial wrap ≈ 315°
-  const SEG_RATE       = 28;      // steps per radian
-  const CORN_STEP      = 22;
-  const cornAng        = 0.18;    // base corner arc angular radius
+  const linesPerBundle = Math.max(8, Math.floor(8 + n * 0.35));
+  const lineSpacing    = 0.034;    // angular spacing between bundle lines (radians)
+  const baseRadius     = 0.55;     // corner arc radius in (phi,theta) radians — wide sweeping curves
+  const ARC_STEPS      = 36;
 
-  function d3(a,b){ return a.x*b.x+a.y*b.y+a.z*b.z; }
-  function c3(a,b){ return {x:a.y*b.z-a.z*b.y, y:a.z*b.x-a.x*b.z, z:a.x*b.y-a.y*b.x}; }
-  function n3(v)  { const l=Math.sqrt(v.x*v.x+v.y*v.y+v.z*v.z)||1; return {x:v.x/l,y:v.y/l,z:v.z/l}; }
+  const phi0 = S.seed * (2 * Math.PI / 11);
+  const seed  = Math.min(S.seed, 10);
 
-  function sph(phi, theta) {
-    theta = Math.max(0.06, Math.min(Math.PI - 0.06, theta));
-    return { x: Math.sin(theta)*Math.cos(phi), y: Math.sin(theta)*Math.sin(phi), z: Math.cos(theta) };
+  // ── Line intersection helper ──────────────────────────────────────────
+  function lineIsect(p1x, p1y, d1x, d1y, p2x, p2y, d2x, d2y) {
+    const cross = d1x * d2y - d1y * d2x;
+    if (Math.abs(cross) < 1e-8) return { x: p1x, y: p1y };
+    const t = ((p2x - p1x) * d2y - (p2y - p1y) * d2x) / cross;
+    return { x: p1x + d1x * t, y: p1y + d1y * t };
   }
-  function slerp(p0, p1, t) {
-    const dd = Math.max(-1, Math.min(1, d3(p0,p1)));
-    const a  = Math.acos(dd);
-    if (a < 0.001) return {x:p0.x*(1-t)+p1.x*t, y:p0.y*(1-t)+p1.y*t, z:p0.z*(1-t)+p1.z*t};
-    const sa = Math.sin(a), f0 = Math.sin((1-t)*a)/sa, f1 = Math.sin(t*a)/sa;
-    return {x:f0*p0.x+f1*p1.x, y:f0*p0.y+f1*p1.y, z:f0*p0.z+f1*p1.z};
-  }
-  function geoArc(p0, p1, steps) {
-    const dd = Math.max(-1, Math.min(1, d3(p0,p1)));
-    const a  = Math.acos(dd);
-    if (a < 0.001) return [p0, p1];
-    const sa = Math.sin(a), pts = [];
-    for (let i = 0; i <= steps; i++) {
-      const t = i/steps, f0 = Math.sin((1-t)*a)/sa, f1 = Math.sin(t*a)/sa;
-      pts.push({x:f0*p0.x+f1*p1.x, y:f0*p0.y+f1*p1.y, z:f0*p0.z+f1*p1.z});
+
+  // ── Trace one offset line in flat (phi, theta) space ──────────────────
+  // Exact same algorithm as the proven flat traceOffsetLine, but operating
+  // in radian coordinates. Produces perfect parallel lines + circular arcs.
+  function traceOffsetLine(waypoints, lineOffset) {
+    if (waypoints.length < 2) return [];
+
+    const segs = [];
+    for (let i = 0; i < waypoints.length - 1; i++) {
+      const a = waypoints[i], b = waypoints[i + 1];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const len = Math.hypot(dx, dy);
+      if (len < 1e-6) continue;
+      const ux = dx / len, uy = dy / len;
+      const nx = -uy, ny = ux;
+      segs.push({ ax: a.x, ay: a.y, bx: b.x, by: b.y, ux, uy, nx, ny });
     }
-    return pts;
-  }
+    if (!segs.length) return [];
 
-  // Small-circle arc: sweeps from p0 to p1 at constant angular distance from pole.
-  // This is the sphere analog of a planar circular arc — a true smooth curve.
-  function smallArc(pole, p0, p1, steps) {
-    const rr = Math.acos(Math.max(-1, Math.min(1, d3(pole, p0))));
-    if (rr < 1e-4) return geoArc(p0, p1, steps);
-    const cr = Math.cos(rr), sr = Math.sin(rr);
-    // orthonormal frame in the tangent plane of pole, u pointing toward p0
-    const u = n3({x:p0.x-cr*pole.x, y:p0.y-cr*pole.y, z:p0.z-cr*pole.z});
-    const v = n3(c3(pole, u));
-    // angle from u to p1 in this frame
-    const p1r = {x:p1.x-cr*pole.x, y:p1.y-cr*pole.y, z:p1.z-cr*pole.z};
-    const a1  = Math.atan2(d3(p1r,v), d3(p1r,u));
+    // Pre-compute arc info at each interior corner
+    const arcInfos = [];
+    for (let i = 0; i < segs.length - 1; i++) {
+      const s1 = segs[i], s2 = segs[i + 1];
+      const cross = s1.ux * s2.uy - s1.uy * s2.ux;
+      const px = cross > 0 ? -s1.uy :  s1.uy;
+      const py = cross > 0 ?  s1.ux : -s1.ux;
+      const dotPA = s1.nx * px + s1.ny * py;
+      const effectiveR = Math.max(0.01, baseRadius + lineOffset * (dotPA > 0 ? -1 : 1));
+      const dot12 = Math.max(-1, Math.min(1, s1.ux * s2.ux + s1.uy * s2.uy));
+      const tangentLen = effectiveR * Math.tan(Math.acos(dot12) / 2);
+      arcInfos.push({ px, py, effectiveR, tangentLen, cross });
+    }
+
+    // Pre-compute offset corners
+    const offsetCorners = [];
+    for (let i = 0; i < segs.length - 1; i++) {
+      const s1 = segs[i], s2 = segs[i + 1];
+      const p1x = s1.bx + s1.nx * lineOffset, p1y = s1.by + s1.ny * lineOffset;
+      const p2x = s2.ax + s2.nx * lineOffset, p2y = s2.ay + s2.ny * lineOffset;
+      offsetCorners.push(lineIsect(p1x, p1y, s1.ux, s1.uy, p2x, p2y, s2.ux, s2.uy));
+    }
+
+    // Emit points: straight → arc → straight → …
     const pts = [];
-    for (let i = 0; i <= steps; i++) {
-      const a = a1 * i / steps;
-      pts.push(n3({
-        x: cr*pole.x + sr*(Math.cos(a)*u.x + Math.sin(a)*v.x),
-        y: cr*pole.y + sr*(Math.cos(a)*u.y + Math.sin(a)*v.y),
-        z: cr*pole.z + sr*(Math.cos(a)*u.z + Math.sin(a)*v.z),
-      }));
-    }
-    return pts;
-  }
+    for (let i = 0; i < segs.length; i++) {
+      const s = segs[i];
+      const trimS = (i > 0)              ? arcInfos[i - 1].tangentLen : 0;
+      const trimE = (i < segs.length - 1) ? arcInfos[i].tangentLen    : 0;
 
-  // Rotate p toward unit dir by angle a (dir ⊥ to p)
-  function rotTo(p, dir, a) {
-    const cc = Math.cos(a), ss = Math.sin(a);
-    return {x: cc*p.x+ss*dir.x, y: cc*p.y+ss*dir.y, z: cc*p.z+ss*dir.z};
-  }
-
-  // Build multi-segment path through waypoints.
-  // cornAngles[j] = arc radius for wps[j+1] (j=0..N-3). 0 = pass-through joint.
-  function buildPath(wps, cornAngles) {
-    const N = wps.length;
-    const backs = [], fwds = [];
-    for (let j = 0; j < N-2; j++) {
-      const ca = cornAngles[j], wp = wps[j+1], prev = wps[j], nxt = wps[j+2];
-      if (ca < 0.001) { backs.push(wp); fwds.push(wp); continue; }
-      const a1 = Math.acos(Math.max(-1, Math.min(1, d3(prev, wp))));
-      const a2 = Math.acos(Math.max(-1, Math.min(1, d3(wp,   nxt))));
-      backs.push(slerp(prev, wp,  a1 > ca ? (a1-ca)/a1 : 0.02));
-      fwds.push( slerp(wp,  nxt,  a2 > ca ? ca/a2       : 0.98));
-    }
-    const pts = [];
-    for (let i = 0; i < N-1; i++) {
-      const sS = (i===0)   ? wps[0]   : fwds[i-1];
-      const sE = (i===N-2) ? wps[N-1] : backs[i];
-      const ang = Math.acos(Math.max(-1, Math.min(1, d3(sS, sE))));
-      const seg = geoArc(sS, sE, Math.max(3, Math.round(SEG_RATE * ang)));
-      if (i===0) pts.push(...seg); else pts.push(...seg.slice(1));
-      if (i < N-2 && cornAngles[i] >= 0.001) {
-        const prev = wps[i], wp = wps[i+1], nxt = wps[i+2];
-        const backPt = backs[i], fwdPt = fwds[i];
-        const ca = cornAngles[i];
-        const ds = d3(wp, prev);
-        const tI = n3({x:ds*wp.x-prev.x, y:ds*wp.y-prev.y, z:ds*wp.z-prev.z});
-        const de = d3(wp, nxt);
-        const tO = n3({x:nxt.x-de*wp.x,  y:nxt.y-de*wp.y,  z:nxt.z-de*wp.z});
-        const ts = d3(c3(tI, tO), wp);
-        const ti = n3({x:wp.x-d3(wp,backPt)*backPt.x, y:wp.y-d3(wp,backPt)*backPt.y, z:wp.z-d3(wp,backPt)*backPt.z});
-        const inw = ts >= 0 ? n3(c3(backPt, ti)) : n3(c3(ti, backPt));
-        const pole = n3({x:Math.cos(ca)*backPt.x+Math.sin(ca)*inw.x, y:Math.cos(ca)*backPt.y+Math.sin(ca)*inw.y, z:Math.cos(ca)*backPt.z+Math.sin(ca)*inw.z});
-        pts.push(...smallArc(pole, backPt, fwdPt, CORN_STEP).slice(1));
-      }
-    }
-    return pts;
-  }
-
-  // Build bundle-offset version: offset each waypoint, scale corner arcs for inner/outer lines
-  function buildOffsetPath(wps, cornAngles, delta) {
-    const N = wps.length;
-    const offWps = wps.map((wp, i) => {
-      let lat;
+      let sx, sy;
       if (i === 0) {
-        const tOut = n3({x:wps[1].x-d3(wps[1],wp)*wp.x, y:wps[1].y-d3(wps[1],wp)*wp.y, z:wps[1].z-d3(wps[1],wp)*wp.z});
-        lat = n3(c3(wp, tOut));
-      } else if (i === N-1) {
-        const tIn = n3({x:d3(wp,wps[N-2])*wp.x-wps[N-2].x, y:d3(wp,wps[N-2])*wp.y-wps[N-2].y, z:d3(wp,wps[N-2])*wp.z-wps[N-2].z});
-        lat = n3(c3(wp, tIn));
+        sx = s.ax + s.nx * lineOffset;
+        sy = s.ay + s.ny * lineOffset;
       } else {
-        const ds = d3(wp, wps[i-1]);
-        const tI = n3({x:ds*wp.x-wps[i-1].x, y:ds*wp.y-wps[i-1].y, z:ds*wp.z-wps[i-1].z});
-        const de = d3(wp, wps[i+1]);
-        const tO = n3({x:wps[i+1].x-de*wp.x, y:wps[i+1].y-de*wp.y, z:wps[i+1].z-de*wp.z});
-        const latI = n3(c3(wp, tI));
-        const latO = n3(c3(wp, tO));
-        const mv = {x:latI.x+latO.x, y:latI.y+latO.y, z:latI.z+latO.z};
-        const ml = Math.sqrt(mv.x*mv.x+mv.y*mv.y+mv.z*mv.z);
-        const md = ml > 1e-6 ? n3(mv) : latI;
-        const mf = ml > 0.3 ? Math.min(2.5, 2.0/ml) : 1.0;
-        return n3(rotTo(wp, md, delta*mf));
+        const oc = offsetCorners[i - 1];
+        sx = oc.x + s.ux * trimS;
+        sy = oc.y + s.uy * trimS;
       }
-      return n3(rotTo(wp, lat, delta));
-    });
-    const offCas = cornAngles.map((ca, j) => {
-      if (ca < 0.001) return 0;
-      const prev = wps[j], wp = wps[j+1], nxt = wps[j+2];
-      const ds = d3(wp, prev);
-      const tI = n3({x:ds*wp.x-prev.x, y:ds*wp.y-prev.y, z:ds*wp.z-prev.z});
-      const de = d3(wp, nxt);
-      const tO = n3({x:nxt.x-de*wp.x, y:nxt.y-de*wp.y, z:nxt.z-de*wp.z});
-      const ts = d3(c3(tI, tO), wp);
-      return Math.max(0.025, ca + delta * (ts >= 0 ? -1 : 1));
-    });
-    return buildPath(offWps, offCas);
+
+      let ex, ey;
+      if (i < segs.length - 1) {
+        const oc = offsetCorners[i];
+        ex = oc.x - s.ux * trimE;
+        ey = oc.y - s.uy * trimE;
+      } else {
+        ex = s.bx + s.nx * lineOffset;
+        ey = s.by + s.ny * lineOffset;
+      }
+
+      if (pts.length === 0) pts.push({ x: sx, y: sy });
+
+      // Straight portion — sample every ~0.02 rad
+      const segLen = Math.hypot(ex - sx, ey - sy);
+      if (segLen > 0.001) {
+        const steps = Math.max(1, Math.ceil(segLen / 0.02));
+        for (let j = 1; j <= steps; j++) {
+          const t = j / steps;
+          pts.push({ x: sx + (ex - sx) * t, y: sy + (ey - sy) * t });
+        }
+      }
+
+      // Arc at corner
+      if (i < segs.length - 1) {
+        const { px, py, effectiveR, tangentLen, cross } = arcInfos[i];
+        const arcCx = ex + px * effectiveR;
+        const arcCy = ey + py * effectiveR;
+        const oc = offsetCorners[i];
+        const ns = segs[i + 1];
+        const nextSx = oc.x + ns.ux * tangentLen;
+        const nextSy = oc.y + ns.uy * tangentLen;
+
+        let fromA = Math.atan2(ey - arcCy, ex - arcCx);
+        let toA   = Math.atan2(nextSy - arcCy, nextSx - arcCx);
+        let da    = toA - fromA;
+        if (cross > 0  && da < 0) da += Math.PI * 2;
+        if (cross <= 0 && da > 0) da -= Math.PI * 2;
+
+        for (let j = 1; j <= ARC_STEPS; j++) {
+          const a = fromA + da * j / ARC_STEPS;
+          pts.push({ x: arcCx + effectiveR * Math.cos(a), y: arcCy + effectiveR * Math.sin(a) });
+        }
+      }
+    }
+    return pts;
   }
 
-  // S-path: south edge → equator (turn) → wrap ≈315° → equator (turn) → north edge.
-  // eq1/eq2 split the equatorial arc into sub-arcs < π so geoArc takes the correct direction.
-  const phi = S.seed * (2 * Math.PI / 11);
-  const trunkWps = [
-    sph(phi,               Math.PI/2 + legV),   // start: south pole edge
-    sph(phi,               Math.PI/2),           // corner1: equator, first turn
-    sph(phi + wrapAng/3,   Math.PI/2),           // eq1: pass-through
-    sph(phi + 2*wrapAng/3, Math.PI/2),           // eq2: pass-through
-    sph(phi + wrapAng,     Math.PI/2),           // corner2: equator, second turn
-    sph(phi + wrapAng,     Math.PI/2 - legV),   // end: north pole edge
-  ];
-  const trunkCas = [cornAng, 0, 0, cornAng];
+  // ── Convert flat (phi, theta) point to 3D unit vector ─────────────────
+  function toSphere(pt) {
+    const theta = Math.max(0.06, Math.min(Math.PI - 0.06, pt.y));
+    return {
+      x: Math.sin(theta) * Math.cos(pt.x),
+      y: Math.sin(theta) * Math.sin(pt.x),
+      z: Math.cos(theta)
+    };
+  }
 
-  for (let li = 0; li < linesPerBundle; li++) {
-    const delta = (li - (linesPerBundle - 1) / 2) * angSpacing;
-    const pts3D = delta === 0
-      ? buildPath(trunkWps, trunkCas)
-      : buildOffsetPath(trunkWps, trunkCas, delta);
-    if (pts3D.length > 2) {
-      paths.push({ pts3D, off: rng() * UNIT * 4, sp: 0.15 + rng() * 0.15 });
+  // ── Seed-driven path variations in flat (phi, theta) space ─────────────
+  // All paths are continuous pole-to-pole lines. Three trunk types:
+  //   S-curve: vertical → horizontal wrap → vertical (2 smooth corners)
+  //   Vertical: straight meridian from top to bottom
+  //   Horizontal: latitude circle wrapping around the sphere
+  // Each layout combines 2–4 of these, all running from south edge to north edge.
+  const HP = Math.PI / 2;
+  const p = phi0;
+  const N = HP - 1.3, S_ = HP + 1.3;  // north/south pole edges
+
+  // Bundle half-width determines safe latitude gap between horizontal segments
+  const bundleHalfW = (linesPerBundle - 1) / 2 * lineSpacing;
+  const gap = bundleHalfW * 2 + 0.25;  // full bundle width + visible buffer between bundles
+
+  // S-curve helper: south(φ₁) → equator(φ₁,lat) → wrap → equator(φ₂,lat) → north(φ₂)
+  function sCurve(ph, wrap, lat) {
+    return [{x:ph,y:S_},{x:ph,y:lat},{x:ph+wrap,y:lat},{x:ph+wrap,y:N}];
+  }
+  // Counter S-curve: offsets phi endpoints inward by g so verticals don't overlap
+  // Primary sCurve(ph, w, lat) has verticals at ph and ph+w.
+  // Counter starts g inside the primary's end, wraps back to g inside the primary's start.
+  // Result: verticals at ph+w∓g and ph±g — safely spaced from primary.
+  function counterS(ph, wrap, lat) {
+    const s = Math.sign(wrap);
+    return sCurve(ph + wrap - s * g, -(wrap - 2 * s * g), lat);
+  }
+  // Vertical helper: straight meridian top to bottom
+  function vert(ph) { return [{x:ph,y:N},{x:ph,y:S_}]; }
+  // π/3 ≈ 60° offset for distributing verticals around the sphere
+  const T = Math.PI / 3;
+  const g = gap;  // shorthand for latitude offsets
+  const LAYOUTS = [
+    // 0 — S right + counter S left + vertical
+    [ sCurve(p, 5.5, HP), counterS(p, 5.5, HP-g), vert(p+Math.PI) ],
+    // 1 — S left + counter S right + vertical
+    [ sCurve(p, -5.5, HP), counterS(p, -5.5, HP+g), vert(p+Math.PI) ],
+    // 2 — two S-curves opposite wraps at different latitudes
+    [ sCurve(p, 5.5, HP+g*0.5), counterS(p, 5.5, HP-g*0.5), vert(p+T*2), vert(p+T*4) ],
+    // 3 — S 270° right + counter S + vertical
+    [ sCurve(p, 4.7, HP), counterS(p, 4.7, HP+g), vert(p+Math.PI) ],
+    // 4 — S 270° left + counter S + vertical
+    [ sCurve(p, -4.7, HP), counterS(p, -4.7, HP-g), vert(p+Math.PI) ],
+    // 5 — S above equator + counter S below + safe vert at midpoint
+    [ sCurve(p, 5.0, HP-g*0.5), counterS(p, 5.0, HP+g*0.5), vert(p+2.5) ],
+    // 6 — two opposing S-curves at different latitudes + vertical
+    [ sCurve(p, 5.5, HP+g*0.5), counterS(p, 5.5, HP-g*0.5), vert(p+Math.PI) ],
+    // 7 — S left above + counter S right below + vertical
+    [ sCurve(p, -5.5, HP-g*0.5), counterS(p, -5.5, HP+g*0.5), vert(p+Math.PI) ],
+    // 8 — wide S 340° + counter S + vertical
+    [ sCurve(p, 5.9, HP), counterS(p, 5.9, HP+g), vert(p+Math.PI) ],
+    // 9 — S right + counter S + two safe verts
+    [ sCurve(p, 5.0, HP), counterS(p, 5.0, HP+g), vert(p+1.8), vert(p+3.2) ],
+    // 10 — S right + counter S + safe vert at midpoint
+    [ sCurve(p, 4.5, HP), counterS(p, 4.5, HP+g), vert(p+2.25) ],
+  ];
+
+  const trunks = LAYOUTS[seed];
+
+  // ── Generate bundles for each trunk ───────────────────────────────────
+  for (let ti = 0; ti < trunks.length; ti++) {
+    const trunkPath = trunks[ti];
+    for (let li = 0; li < linesPerBundle; li++) {
+      const lineOffset = (li - (linesPerBundle - 1) / 2) * lineSpacing;
+      const pts = traceOffsetLine(trunkPath, lineOffset);
+      if (pts.length > 2) {
+        paths.push({ pts3D: pts.map(toSphere), off: rng() * UNIT * 4, sp: 0.15 + rng() * 0.15 });
+      }
     }
   }
 }
@@ -2091,8 +2132,8 @@ function buildCitySphere(r, n) {
   const offRng = mkRand(S.seed * 99991 + 7);
 
   const t        = Math.max(0, Math.min(0.8, (n - 5) / 30));
-  const blockAng = 0.28 - t * 0.16;   // 0.28 → 0.12 rad per block
-  const roadAng  = 0.06 - t * 0.03;   // 0.06 → 0.03 rad per road
+  const blockAng = 0.45 - t * 0.28;   // 0.45 → 0.226 rad per block (larger → fewer blocks, matching flat density)
+  const roadAng  = 0.10 - t * 0.06;   // 0.10 → 0.052 rad per road
   const cellAng  = blockAng + roadAng;
 
   const thetaStart = 0.10;
@@ -3236,12 +3277,6 @@ document.getElementById('exVideo').addEventListener('click', () => {
   const sm = 0.5 + S.speed * 3;
   const savedOff = paths.map(p => p.off);
 
-  // Pre-compute per-path loop speeds without mutating path objects
-  const loopState = paths.map(p => {
-    const adv = FRAMES * p.sp * sm * 0.4, loops = Math.round(adv / UNIT) || 1;
-    return (loops * UNIT) / (FRAMES * sm * 0.4);
-  });
-
   // Pick best supported H.264 MP4 mime type
   const mp4Types = [
     'video/mp4; codecs="avc1.42E01E"',
@@ -3337,7 +3372,7 @@ document.getElementById('exVideo').addEventListener('click', () => {
     if (lastFrameTime === null) lastFrameTime = now;
     if (now - lastFrameTime >= MS_PER_FRAME - 1) {
       lastFrameTime += MS_PER_FRAME;  // advance by fixed step to avoid drift
-      paths.forEach((p, i) => { p.off = f * loopState[i] * sm * 0.4; });
+      paths.forEach((p, i) => { p.off = savedOff[i] + f * p.sp * sm * 0.4; });
       const drift  = S.movement === 'spatial'  ? Math.sin(f * SPATIAL_STEP) * 120
                    : S.movement === 'spatial2' ? Math.sin(f * SPATIAL_STEP) * 85 : 0;
       const driftY = S.movement === 'spatial2' ? Math.sin(f * SPATIAL_STEP * 2) * 50 : 0;
