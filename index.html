@@ -245,7 +245,7 @@
     </section>
 
     <section class="info-section">
-      <p style="opacity:0.45;font-size:0.75rem;margin-top:8px;">Version: 2.1</p>
+      <p style="opacity:0.45;font-size:0.75rem;margin-top:8px;">Version: 2.2</p>
     </section>
 
   </div>
@@ -254,7 +254,16 @@
 </div>
 
 <div id="toast"></div>
-<div id="vp"><div id="vpb"></div></div>
+
+<!-- Export progress modal — shown during Animation / Intro / Outro recording -->
+<div id="export-modal" aria-hidden="true">
+  <div id="export-modal__card">
+    <p id="export-modal__label">EXPORTING VIDEO</p>
+    <p id="export-modal__msg">Please be patient,<br>your video is being exported.</p>
+    <div id="export-modal__track"><div id="export-modal__bar"></div></div>
+    <p id="export-modal__pct">0%</p>
+  </div>
+</div>
 
 <script src="script.js"></script>
 </body>

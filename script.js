@@ -806,6 +806,7 @@ const stage = document.getElementById('stage');
 let W, H;
 
 function resize() {
+  if (S.recording) return;   // never interrupt an active video export
   W = cv.width  = window.innerWidth;
   H = cv.height = window.innerHeight;
   rebuild();
@@ -3240,6 +3241,16 @@ function drawExportSphere(ctx, rotAngle, drawProgress) {
 }
 
 function renderPatternToCanvas(ew, eh) {
+  // Pause the live animation and snapshot current offsets for seamless resumption
+  cancelAnimationFrame(animId);
+  const savedW = W, savedH = H;
+  const liveOff = paths.map(p => p.off);
+
+  // Rebuild at 16:9 reference so sx/sy are always a uniform scale regardless of viewport shape
+  // (cv.width / cv.height are intentionally NOT changed — only the path-generation variables)
+  W = 1920; H = 1080;
+  rebuild();
+
   const tc = document.createElement('canvas'); tc.width=ew; tc.height=eh;
   const tx = tc.getContext('2d');
   const sx = ew / W, sy = eh / H;
@@ -3249,28 +3260,33 @@ function renderPatternToCanvas(ew, eh) {
     tx.save(); tx.scale(sx, sy);
     drawExportSphere(tx, S.spatialX);
     tx.restore();
-    return tc;
-  }
+  } else {
+    // Phase 1: Draw pattern paths (city blocks re-clipped, network lines, terrain splits)
+    tx.save();
+    tx.scale(sx, sy);
+    drawExportPaths(tx, 0);
+    tx.restore();
 
-  // Phase 1: Draw pattern paths (city blocks re-clipped, network lines, terrain splits)
-  tx.save();
-  tx.scale(sx, sy);
-  drawExportPaths(tx, 0);
-  tx.restore();
-
-  // Phase 2: Punch void — clearRect creates transparent hole (PNG) or lets JPG bg show through
-  if (S.shapes.length > 0 && (S.pattern === 'city' || S.pattern === 'networks')) {
-    for (const sh of S.shapes) {
-      tx.clearRect(sh.x * sx, sh.y * sy, sh.w * sx, sh.h * sy);
+    // Phase 2: Punch void — clearRect creates transparent hole (PNG) or lets JPG bg show through
+    if (S.shapes.length > 0 && (S.pattern === 'city' || S.pattern === 'networks')) {
+      for (const sh of S.shapes) {
+        tx.clearRect(sh.x * sx, sh.y * sy, sh.w * sx, sh.h * sy);
+      }
     }
+
+    // Phase 3: Draw perimeters + connections ON TOP of the void boundary
+    tx.save();
+    tx.scale(sx, sy);
+    drawExportPerimeters(tx);
+    drawNetworkCornerConnections(tx, 0);
+    tx.restore();
   }
 
-  // Phase 3: Draw perimeters + connections ON TOP of the void boundary
-  tx.save();
-  tx.scale(sx, sy);
-  drawExportPerimeters(tx);
-  drawNetworkCornerConnections(tx, 0);
-  tx.restore();
+  // Restore live state — cv dimensions were never touched, so no canvas clear occurs
+  W = savedW; H = savedH;
+  rebuild();
+  paths.forEach((p, i) => { if (i < liveOff.length) p.off = liveOff[i]; });
+  (function liveLoop() { draw(); animId = requestAnimationFrame(liveLoop); })();
 
   return tc;
 }
@@ -3313,6 +3329,16 @@ document.getElementById('exJpg').addEventListener('click', () => {
   }, 'image/jpeg', 0.95);
 });
 document.getElementById('exSvg').addEventListener('click', () => {
+  // Pause animation, snapshot offsets for seamless resumption
+  cancelAnimationFrame(animId);
+  const savedW = W, savedH = H;
+  const liveOff = paths.map(p => p.off);
+
+  // Rebuild at 1920×1080 so SVG geometry is always viewport-independent
+  // (cv dimensions intentionally not changed to avoid clearing the live canvas)
+  W = 1920; H = 1080;
+  rebuild();
+
   let body = '';
   // Build unit positions for each path and emit SVG circles + rects
   for (const p of paths) {
@@ -3353,6 +3379,13 @@ document.getElementById('exSvg').addEventListener('click', () => {
 
   const bgRect = `<rect width="${W}" height="${H}" fill="${S.canvasBg}"/>\n`;
   const svg=`<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}">\n${bgRect}<g>\n${body}</g>\n</svg>`;
+
+  // Restore live state — cv dimensions were never changed, so no canvas clear occurs
+  W = savedW; H = savedH;
+  rebuild();
+  paths.forEach((p, i) => { if (i < liveOff.length) p.off = liveOff[i]; });
+  (function liveLoop() { draw(); animId = requestAnimationFrame(liveLoop); })();
+
   const a=document.createElement('a'); a.download='pattern.svg';
   a.href=URL.createObjectURL(new Blob([svg],{type:'image/svg+xml'})); a.click();
   toast('Exported SVG');
@@ -3382,8 +3415,12 @@ function recordVideo(mode) {
   // canonicalOff is captured right after rebuild so every clip (intro, loop, outro)
   // shares the same frame-0 reference — the only way clips tile seamlessly when
   // exported at different times.
-  const liveOff  = paths.map(p => p.off);           // restore live preview after recording
-  const savedOff = canonicalOff ? [...canonicalOff] : liveOff;
+  const liveOff  = paths.map(p => p.off);           // capture before rebuild so live preview can resume
+  // Rebuild at fixed 1920×1080 so all video frames are always correctly proportioned
+  const savedW = W, savedH = H;
+  W = 1920; H = 1080;
+  rebuild();
+  const savedOff = canonicalOff ? [...canonicalOff] : paths.map(p => p.off);
 
   // easeOut for intro (lines rush in), easeIn for outro (lines fade out slowly)
   const easeOut  = (t) => 1 - Math.pow(1 - t, 3);
@@ -3418,7 +3455,10 @@ function recordVideo(mode) {
   const btn = document.getElementById(
     mode === 'loop' ? 'exVideo' : mode === 'intro' ? 'exIntro' : 'exOutro'
   );
-  const prog = document.getElementById('vp'), bar = document.getElementById('vpb');
+  const modal = document.getElementById('export-modal');
+  const bar   = document.getElementById('export-modal__bar');
+  const pct   = document.getElementById('export-modal__pct');
+  const lbl   = document.getElementById('export-modal__label');
 
   const mp4Types = [
     'video/mp4; codecs="avc1.42E01E"',
@@ -3434,14 +3474,18 @@ function recordVideo(mode) {
 
   S.recording = true; btn.classList.add('is-recording');
   btn.textContent = '● Recording…';
-  prog.style.display = 'block'; bar.style.width = '0%';
+  lbl.textContent = mode === 'loop' ? 'Exporting Animation' : mode === 'intro' ? 'Exporting Intro' : 'Exporting Outro';
+  bar.style.width = '0%'; pct.textContent = '0%';
+  modal.setAttribute('aria-hidden', 'false');
   cancelAnimationFrame(animId);
 
   function cleanup() {
-    paths.forEach((p, i) => { p.off = liveOff[i]; });  // resume live preview from where it was
+    W = savedW; H = savedH;                           // restore live canvas dimensions
+    rebuild();
+    paths.forEach((p, i) => { if (i < liveOff.length) p.off = liveOff[i]; });  // resume live preview
     S.recording = false; btn.classList.remove('is-recording');
     btn.textContent = mode === 'loop' ? 'Animation' : mode === 'intro' ? 'Intro' : 'Outro';
-    prog.style.display = 'none'; bar.style.width = '0%';
+    modal.setAttribute('aria-hidden', 'true');
     (function loop() { draw(); animId = requestAnimationFrame(loop); })();
   }
 
@@ -3555,7 +3599,9 @@ function recordVideo(mode) {
       });
 
       drawVideoFrame(animFrame, drawProgress);
-      bar.style.width = ((f + 1) / TOTAL_FRAMES * 100) + '%';
+      const progress = Math.round((f + 1) / TOTAL_FRAMES * 100);
+      bar.style.width = progress + '%';
+      pct.textContent = progress + '%';
       f++;
       if (f >= TOTAL_FRAMES) {
         setTimeout(() => recorder.stop(), 300);
