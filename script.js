@@ -8,23 +8,51 @@ const S = {
   movement: 'fixed', spatialX: 0, driftY: 0,
   speed: 0.5, density: 0.5, seed: 5,
   lineColor: '#FFFFFF', canvasBg: '#DFDFDF',
+  colorMode: 'normal',          // 'normal' | 'radial'
+  radialColorA: '#063BE9',      // radial: center/innermost color
+  radialColorB: '#C0D4FF',      // radial: edge/outermost color
   shapes: [],
   mx: -9999, my: -9999, recording: false,
   networkNodes: null, networkNodes3D: null
 };
 
-// 4 base themes — Invert button swaps lc ↔ bg at runtime
+// Base themes — Invert button swaps lc ↔ bg at runtime.
+// 'radial' uses a fixed blue→light-blue gradient per line; lc/bg set the canvas+accents.
 const THEMES = {
-  'light':   { lc: '#FFFFFF', bg: '#DFDFDF' },   // Light Gray bg / White pattern
-  'color-1': { lc: '#063BE9', bg: '#FFFFFF' },   // White bg / Blue pattern
-  'color-2': { lc: '#112AAC', bg: '#063BE9' },   // Blue bg / Darker-blue pattern
-  'dark':    { lc: '#292929', bg: '#000000' },   // Black bg / Dark Gray pattern
+  'light':   { lc: '#FFFFFF', bg: '#DFDFDF' },
+  'color-1': { lc: '#063BE9', bg: '#FFFFFF' },
+  'color-2': { lc: '#112AAC', bg: '#063BE9' },
+  'dark':    { lc: '#292929', bg: '#000000' },
+  'radial':  { lc: '#063BE9', bg: '#FFFFFF' },   // accent color; lines use radialColorA/B
 };
 
 // Returns true if a hex colour is perceptually light (needs dark panel text)
 function isLight(hex) {
   const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
   return (r*299 + g*587 + b*114) / 1000 > 128;
+}
+
+// Interpolate between two hex colors. t=0 → colorA, t=1 → colorB.
+function lerpColor(colorA, colorB, t) {
+  t = Math.max(0, Math.min(1, t));
+  const pa = parseInt(colorA.slice(1), 16), pb = parseInt(colorB.slice(1), 16);
+  const aR = (pa >> 16) & 0xff, aG = (pa >> 8) & 0xff, aB = pa & 0xff;
+  const bR = (pb >> 16) & 0xff, bG = (pb >> 8) & 0xff, bB = pb & 0xff;
+  const r = Math.round(aR + (bR - aR) * t);
+  const g = Math.round(aG + (bG - aG) * t);
+  const b = Math.round(aB + (bB - aB) * t);
+  return '#' + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
+// Return the radial value (0..1) stored on a path object, or null if not in radial mode.
+// 0 = center/innermost/high → radialColorA (blue); 1 = edge/outermost/low → radialColorB (light).
+function pathRadialVal(p) {
+  if (S.colorMode !== 'radial') return null;
+  if (S.pattern === 'terrain')  return p.terrainVal      ?? null;
+  if (S.pattern === 'pathways') return p.bundleVal       ?? null;
+  if (S.pattern === 'city')     return p.cityColorVal    ?? null;
+  if (S.pattern === 'networks') return p.networkColorVal ?? null;
+  return null;
 }
 
 // Central theme applicator — handles inversion and panel colour switching.
@@ -40,8 +68,18 @@ function applyTheme(key, inverted) {
   S.lineColor = lc; S.canvasBg = bg;
   document.documentElement.style.setProperty('--line-color', lc);
 
+  if (key === 'radial') {
+    S.colorMode = 'radial';
+    // Normal: blue center/high → light-blue edge/low
+    // Inverted: light-blue center/high → blue edge/low (on blue background)
+    S.radialColorA = inverted ? '#FFFFFF' : '#063BE9';
+    S.radialColorB = inverted ? '#3A60F0' : '#C0D4FF';
+  } else {
+    S.colorMode = 'normal';
+  }
+
   const isMenuLight = (key === 'light');
-  const isMenuBlue  = (key === 'color-1' && !inverted);
+  const isMenuBlue  = (key === 'color-1' && !inverted) || (key === 'radial' && !inverted);
   document.body.classList.toggle('menu-light', isMenuLight);
   document.body.classList.toggle('menu-blue',  isMenuBlue);
 }
@@ -858,7 +896,10 @@ function buildTerrain(r, n) {
         // conservative midpoint-bezier avoids the overshoots Catmull-Rom can produce
         // at tight bends, which caused the bar ribbon to break visually.
         const flat = flattenPath(chain);
-        paths.push({ pts: chain, flat, off: r() * UNIT * 4, sp: 0.15 + r() * 0.15 });
+        // radialVal: innermost/highest contour (li=numLevels) → 0 (blue),
+        //            outermost/lowest (li=1) → 1 (light). Matches topo-map convention.
+        const terrainVal = numLevels > 1 ? 1 - (li - 1) / (numLevels - 1) : 0;
+        paths.push({ pts: chain, flat, off: r() * UNIT * 4, sp: 0.15 + r() * 0.15, terrainVal });
       }
     }
   }
@@ -1111,7 +1152,10 @@ function buildPathways(r, n) {
       const lineOffset = (li - (linesPerBundle - 1) / 2) * lineSpacing;
       const pts = traceOffsetLine(trunk, lineOffset);
       if (pts.length > 2) {
-        paths.push({ pts, off: rng() * UNIT * 2, sp: 0.15 + rng() * 0.15 });
+        // bundleVal: center line → 0 (blue), outermost lines → 1 (light)
+        const centerIdx = (linesPerBundle - 1) / 2;
+        const bundleVal = linesPerBundle > 1 ? Math.abs(li - centerIdx) / centerIdx : 0;
+        paths.push({ pts, off: rng() * UNIT * 2, sp: 0.15 + rng() * 0.15, bundleVal });
       }
     }
   }
@@ -1299,7 +1343,8 @@ function buildCity(r, n) {
         if (pts.length > 4) {
           paths.push({ pts, off: rng() * UNIT * 2, sp: 0.15 + rng() * 0.15, rigid: true,
                         blockPoly: poly.map(p => ({ x: p.x, y: p.y })),
-                        blockRoadW: roadWidth });
+                        blockRoadW: roadWidth,
+                        cityColorVal: rng() });  // random radial value per block
         }
       }
 
@@ -1348,7 +1393,8 @@ function buildNetworks(r, n) {
       const t = i / steps;
       pts.push({ x: p0.x + dx * t, y: p0.y + dy * t });
     }
-    paths.push({ pts, off: offRng() * UNIT * 2, sp: 0.15 + offRng() * 0.15, rigid: true });
+    paths.push({ pts, off: offRng() * UNIT * 2, sp: 0.15 + offRng() * 0.15, rigid: true,
+                  networkColorVal: offRng() });  // random radial value per edge
   }
 
   // Only store canvas-visible nodes for dot rendering
@@ -1805,8 +1851,10 @@ function pointAtDistance(flat, dists, totalLen, d) {
            angle: Math.atan2(flat[hi].y - flat[lo].y, flat[hi].x - flat[lo].x) };
 }
 
-// Draw filled circle+bar units along a flattened path (matches Lines.svg style)
-function drawUnits(ctx, flat, off, color, drawProgress) {
+// Draw filled circle+bar units along a flattened path (matches Lines.svg style).
+// radialVal (0..1): if provided and colorMode==='radial', overrides color with a
+// solid per-line color lerped from S.radialColorA (0) to S.radialColorB (1).
+function drawUnits(ctx, flat, off, color, drawProgress, radialVal) {
   if (flat.length < 2) return;
   const dists = [0];
   for (let i = 1; i < flat.length; i++)
@@ -1815,7 +1863,11 @@ function drawUnits(ctx, flat, off, color, drawProgress) {
   const effectiveLen = (drawProgress != null && drawProgress < 1) ? totalLen * drawProgress : totalLen;
   if (effectiveLen < 1) return;
   const atDist = d => pointAtDistance(flat, dists, totalLen, d);
-  ctx.fillStyle = color;
+  // Each path gets one solid color for the entire line — no per-dash color change.
+  const lineColor = (S.colorMode === 'radial' && radialVal != null)
+    ? lerpColor(S.radialColorA, S.radialColorB, radialVal)
+    : color;
+  ctx.fillStyle = lineColor;
   for (let d = -(off%UNIT); d < effectiveLen; d += UNIT) {
     // Filled circle
     const cD = d+CR;
@@ -1917,7 +1969,8 @@ function buildTerrainSphere(r, n) {
     for (const chain of chains) {
       if (chain.length >= 4) {
         const pts3D = smooth3D(chain.map(pt => toSphere(pt.x, pt.y)), 3);
-        paths.push({ pts3D, off: r() * UNIT * 4, sp: 0.15 + r() * 0.15 });
+        const terrainVal = numLevels > 1 ? 1 - (li - 1) / (numLevels - 1) : 0;
+        paths.push({ pts3D, off: r() * UNIT * 4, sp: 0.15 + r() * 0.15, terrainVal });
       }
     }
   }
@@ -2126,7 +2179,9 @@ function buildPathwaysSphere(r, n) {
       const lineOffset = (li - (linesPerBundle - 1) / 2) * lineSpacing;
       const pts = traceOffsetLine(trunkPath, lineOffset);
       if (pts.length > 2) {
-        paths.push({ pts3D: pts.map(toSphere), off: rng() * UNIT * 4, sp: 0.15 + rng() * 0.15 });
+        const centerIdx = (linesPerBundle - 1) / 2;
+        const bundleVal = linesPerBundle > 1 ? Math.abs(li - centerIdx) / centerIdx : 0;
+        paths.push({ pts3D: pts.map(toSphere), off: rng() * UNIT * 4, sp: 0.15 + rng() * 0.15, bundleVal });
       }
     }
   }
@@ -2263,7 +2318,7 @@ function buildCitySphere(r, n) {
 
         const pts3D = polyToPath3D(frag);
         if (pts3D.length > 4)
-          paths.push({ pts3D, off: offRng() * UNIT * 2, sp: 0.15 + offRng() * 0.15 });
+          paths.push({ pts3D, off: offRng() * UNIT * 2, sp: 0.15 + offRng() * 0.15, cityColorVal: offRng() });
       }
     }
   }
@@ -2338,7 +2393,7 @@ function buildNetworksSphere(r, n) {
           pts3D.push({ x: f0*p0.x+f1*p1.x, y: f0*p0.y+f1*p1.y, z: f0*p0.z+f1*p1.z });
         }
       }
-      paths.push({ pts3D, off: offRng() * UNIT * 2, sp: 0.15 + offRng() * 0.15, rigid: true });
+      paths.push({ pts3D, off: offRng() * UNIT * 2, sp: 0.15 + offRng() * 0.15, rigid: true, networkColorVal: offRng() });
     }
   }
   S.networkNodes3D = nodes3D;
@@ -2352,7 +2407,7 @@ function buildNetworksSphere(r, n) {
 // Arc-length parameterization on the ORIGINAL 2D path ensures animation speed
 // is uniform — the dot advance rate is constant in canvas-space, so there are
 // no speed jumps as the sphere rotates or path segments appear/disappear.
-function drawUnitsOnSphere(ctx, srcPts, off, color, rotAngle, drawProgress) {
+function drawUnitsOnSphere(ctx, srcPts, off, color, rotAngle, drawProgress, radialVal) {
   if (srcPts.length < 2) return;
   // Cumulative arc lengths along original 2D path
   const dists = [0];
@@ -2372,7 +2427,9 @@ function drawUnitsOnSphere(ctx, srcPts, off, color, rotAngle, drawProgress) {
              y: srcPts[lo].y + (srcPts[hi].y - srcPts[lo].y) * t };
   }
 
-  ctx.fillStyle = color;
+  const lineColor = (S.colorMode === 'radial' && radialVal != null)
+    ? lerpColor(S.radialColorA, S.radialColorB, radialVal) : color;
+  ctx.fillStyle = lineColor;
   for (let d = -(off % UNIT); d < effectiveLen; d += UNIT) {
     // ── Circle ──────────────────────────────────────────────────────
     const cD = d + CR;
@@ -2427,7 +2484,7 @@ function project3D(p3, rotAngle) {
 
 // Draw dot-bar units along a native 3D sphere path (pts3D = [{x,y,z}] unit vectors).
 // Arc lengths are scaled by SR to screen-pixel equivalents for speed parity with flat mode.
-function drawUnitsOnSphere3D(ctx, pts3D, off, color, rotAngle, drawProgress) {
+function drawUnitsOnSphere3D(ctx, pts3D, off, color, rotAngle, drawProgress, radialVal) {
   if (pts3D.length < 2) return;
   const SR = Math.min(W, H) * 0.44;
   const dists = [0];
@@ -2449,7 +2506,9 @@ function drawUnitsOnSphere3D(ctx, pts3D, off, color, rotAngle, drawProgress) {
              z: pts3D[lo].z + (pts3D[hi].z - pts3D[lo].z) * t };
   }
 
-  ctx.fillStyle = color;
+  const lineColor = (S.colorMode === 'radial' && radialVal != null)
+    ? lerpColor(S.radialColorA, S.radialColorB, radialVal) : color;
+  ctx.fillStyle = lineColor;
   for (let d = -(off % UNIT); d < effectiveLen; d += UNIT) {
     const cD = d + CR;
     if (cD >= 0 && cD <= effectiveLen) {
@@ -2614,7 +2673,7 @@ function draw(ts = performance.now()) {
 
     for (const p of paths) {
       if (!p.pts3D || p.pts3D.length < 2) continue;
-      drawUnitsOnSphere3D(cx, p.pts3D, p.off, S.lineColor, s4rot);
+      drawUnitsOnSphere3D(cx, p.pts3D, p.off, S.lineColor, s4rot, undefined, pathRadialVal(p));
     }
 
     // Network node dots — projected from native 3D positions
@@ -2685,7 +2744,7 @@ function draw(ts = performance.now()) {
             }
           }
           fragPts.push(fragPts[0]);
-          if (fragPts.length > 4) drawUnits(cx, flattenPath(fragPts), p.off, S.lineColor);
+          if (fragPts.length > 4) drawUnits(cx, flattenPath(fragPts), p.off, S.lineColor, undefined, pathRadialVal(p));
         }
         continue;
       }
@@ -2694,10 +2753,10 @@ function draw(ts = performance.now()) {
       // in that case deformPath must run to split paths at shape boundaries (uses p.pts).
       const needsDeform = S.pattern === 'terrain' && S.shapes.length > 0;
       if (p.flat && !needsDeform) {
-        drawUnits(cx, p.flat, p.off, S.lineColor);
+        drawUnits(cx, p.flat, p.off, S.lineColor, undefined, pathRadialVal(p));
       } else {
         const subs = deformPath(p, drift);
-        for (const flat_r of subs) drawUnits(cx, flat_r, p.off, S.lineColor);
+        for (const flat_r of subs) drawUnits(cx, flat_r, p.off, S.lineColor, undefined, pathRadialVal(p));
       }
     }
 
@@ -2725,7 +2784,7 @@ function draw(ts = performance.now()) {
   for (const p of paths) {
     if (!p.screenFixed) continue;
     const flat_r = flattenPath(p.pts);
-    drawUnits(cx, flat_r, p.off, S.lineColor);
+    drawUnits(cx, flat_r, p.off, S.lineColor, undefined, pathRadialVal(p));
   }
 
   // ── Network: dynamic corner-to-node connections + corner dots ──
@@ -3092,7 +3151,7 @@ function drawExportPerimeters(ctx) {
   // Network: screenFixed perimeter paths already built in paths array
   for (const p of paths) {
     if (!p.screenFixed) continue;
-    drawUnits(ctx, flattenPath(p.pts), p.off, S.lineColor);
+    drawUnits(ctx, flattenPath(p.pts), p.off, S.lineColor, undefined, pathRadialVal(p));
   }
   // City: no perimeter lines in export — the void gap speaks for itself
 }
@@ -3133,11 +3192,11 @@ function drawExportPaths(ctx, drift, drawProgress) {
           for (let j=0; j<steps; j++) { const t=j/steps; pts.push({x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t}); }
         }
         pts.push(pts[0]);
-        drawUnits(ctx, flattenPath(pts), p.off, S.lineColor, drawProgress);
+        drawUnits(ctx, flattenPath(pts), p.off, S.lineColor, drawProgress, pathRadialVal(p));
       }
     } else {
       const subs = deformPath(p, drift);
-      for (const flat_r of subs) drawUnits(ctx, flat_r, p.off, S.lineColor, drawProgress);
+      for (const flat_r of subs) drawUnits(ctx, flat_r, p.off, S.lineColor, drawProgress, pathRadialVal(p));
     }
   }
 }
@@ -3167,7 +3226,7 @@ function drawExportSphere(ctx, rotAngle, drawProgress) {
       const startAt = (i / (N - 1)) * STAGGER;
       pathDP = Math.max(0, Math.min(1, (drawProgress - startAt) / (1 - STAGGER)));
     }
-    drawUnitsOnSphere3D(ctx, p.pts3D, p.off, S.lineColor, rotAngle, pathDP);
+    drawUnitsOnSphere3D(ctx, p.pts3D, p.off, S.lineColor, rotAngle, pathDP, pathRadialVal(p));
   }
 
   if (S.pattern === 'networks' && S.networkNodes3D) {
@@ -3254,10 +3313,13 @@ document.getElementById('exJpg').addEventListener('click', () => {
   }, 'image/jpeg', 0.95);
 });
 document.getElementById('exSvg').addEventListener('click', () => {
-  const col = S.lineColor;
   let body = '';
   // Build unit positions for each path and emit SVG circles + rects
   for (const p of paths) {
+    const rv = pathRadialVal(p);
+    const col = (S.colorMode === 'radial' && rv != null)
+      ? lerpColor(S.radialColorA, S.radialColorB, rv)
+      : S.lineColor;
     const subs = deformPath(p, 0);
     for (const flat of subs) {
     if (flat.length < 2) continue;
@@ -3286,7 +3348,8 @@ document.getElementById('exSvg').addEventListener('click', () => {
     }
     }
   }
-  if(S.networkNodes){for(const n of S.networkNodes){const d=repulse(n.x,n.y,0);body+=`<circle cx="${(n.x+d.ox).toFixed(1)}" cy="${(n.y+d.oy).toFixed(1)}" r="${CR}" fill="${col}"/>\n`;}}
+  const nodeCol = S.colorMode === 'radial' ? lerpColor(S.radialColorA, S.radialColorB, 0) : S.lineColor;
+  if(S.networkNodes){for(const n of S.networkNodes){const d=repulse(n.x,n.y,0);body+=`<circle cx="${(n.x+d.ox).toFixed(1)}" cy="${(n.y+d.oy).toFixed(1)}" r="${CR}" fill="${nodeCol}"/>\n`;}}
 
   const bgRect = `<rect width="${W}" height="${H}" fill="${S.canvasBg}"/>\n`;
   const svg=`<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}">\n${bgRect}<g>\n${body}</g>\n</svg>`;
