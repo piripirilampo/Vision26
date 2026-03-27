@@ -778,6 +778,7 @@ window.addEventListener('resize', resize);
 // PATTERN GENERATORS — MODULAR ARCHITECTURE
 // ================================================================
 let paths = [];
+let canonicalOff = null; // Offsets captured right after rebuild — shared frame-0 reference for all export clips
 
 /**
  * TERRAIN GENERATOR
@@ -1136,6 +1137,8 @@ function rebuild() {
     else if (S.pattern === 'city')     buildCity(r, Math.floor(5 + d * 30));
     else                               buildNetworks(r, Math.floor(5 + d * 2 * 30));
   }
+  // Snapshot initial offsets so all export clips share the same loop frame-0 reference
+  canonicalOff = paths.map(p => p.off);
 }
 
 
@@ -1803,15 +1806,17 @@ function pointAtDistance(flat, dists, totalLen, d) {
 }
 
 // Draw filled circle+bar units along a flattened path (matches Lines.svg style)
-function drawUnits(ctx, flat, off, color) {
+function drawUnits(ctx, flat, off, color, drawProgress) {
   if (flat.length < 2) return;
   const dists = [0];
   for (let i = 1; i < flat.length; i++)
     dists.push(dists[i-1] + Math.hypot(flat[i].x-flat[i-1].x, flat[i].y-flat[i-1].y));
   const totalLen = dists[dists.length-1];
+  const effectiveLen = (drawProgress != null && drawProgress < 1) ? totalLen * drawProgress : totalLen;
+  if (effectiveLen < 1) return;
   const atDist = d => pointAtDistance(flat, dists, totalLen, d);
   ctx.fillStyle = color;
-  for (let d = -(off%UNIT); d < totalLen; d += UNIT) {
+  for (let d = -(off%UNIT); d < effectiveLen; d += UNIT) {
     // Filled circle
     const cD = d+CR;
     if (cD >= -CR && cD <= totalLen+CR) {
@@ -1821,8 +1826,8 @@ function drawUnits(ctx, flat, off, color) {
     // Curved bar — polygon ribbon that bends along the path
     const bStart = d + CR*2 + GAP;
     const bEnd   = bStart + BW;
-    if (bEnd >= 0 && bStart <= totalLen) {
-      const cs = Math.max(0, bStart), ce = Math.min(totalLen, bEnd);
+    if (bEnd >= 0 && bStart <= effectiveLen) {
+      const cs = Math.max(0, bStart), ce = Math.min(effectiveLen, bEnd);
       const steps = Math.max(2, Math.ceil((ce - cs) / 3));
       const top = [], bot = [];
       for (let si = 0; si <= steps; si++) {
@@ -1924,7 +1929,9 @@ function buildTerrainSphere(r, n) {
 function buildPathwaysSphere(r, n) {
   const rng            = mkRand(Math.floor(r() * 10000));
   const linesPerBundle = Math.max(8, Math.floor(8 + n * 0.35));
-  const lineSpacing    = 0.034;    // angular spacing between bundle lines (radians)
+  // Convert flat-mode pixel spacing (20px) to radians so the sphere bundle looks
+  // identical in density to the flat version: gap ≈ line width (BH ≈ 9px).
+  const lineSpacing    = 20 / (Math.min(W, H) * 0.44);
   const baseRadius     = 0.55;     // corner arc radius in (phi,theta) radians — wide sweeping curves
   const ARC_STEPS      = 36;
 
@@ -2337,18 +2344,23 @@ function buildNetworksSphere(r, n) {
   S.networkNodes3D = nodes3D;
 }
 
+
+
+
+
 // Draw dot-bar units along a 2D path using sphere projection for Spatial 3.
 // Arc-length parameterization on the ORIGINAL 2D path ensures animation speed
 // is uniform — the dot advance rate is constant in canvas-space, so there are
 // no speed jumps as the sphere rotates or path segments appear/disappear.
-function drawUnitsOnSphere(ctx, srcPts, off, color, rotAngle) {
+function drawUnitsOnSphere(ctx, srcPts, off, color, rotAngle, drawProgress) {
   if (srcPts.length < 2) return;
   // Cumulative arc lengths along original 2D path
   const dists = [0];
   for (let i = 1; i < srcPts.length; i++)
     dists.push(dists[i-1] + Math.hypot(srcPts[i].x-srcPts[i-1].x, srcPts[i].y-srcPts[i-1].y));
   const totalLen = dists[dists.length-1];
-  if (totalLen < 1) return;
+  const effectiveLen = (drawProgress != null && drawProgress < 1) ? totalLen * drawProgress : totalLen;
+  if (effectiveLen < 1) return;
 
   // 2D canvas point at arc-length d
   function pt2dAtD(d) {
@@ -2361,18 +2373,18 @@ function drawUnitsOnSphere(ctx, srcPts, off, color, rotAngle) {
   }
 
   ctx.fillStyle = color;
-  for (let d = -(off % UNIT); d < totalLen; d += UNIT) {
+  for (let d = -(off % UNIT); d < effectiveLen; d += UNIT) {
     // ── Circle ──────────────────────────────────────────────────────
     const cD = d + CR;
-    if (cD >= 0 && cD <= totalLen) {
+    if (cD >= 0 && cD <= effectiveLen) {
       const p2d = pt2dAtD(cD);
       const pp = sphereProject(p2d.x, p2d.y, rotAngle);
       if (pp) { ctx.beginPath(); ctx.arc(pp.x, pp.y, CR, 0, Math.PI * 2); ctx.fill(); }
     }
     // ── Bar — sample arc positions, project each, draw ribbon ───────
     const bStart = d + CR * 2 + GAP, bEnd = bStart + BW;
-    if (bEnd >= 0 && bStart <= totalLen) {
-      const cs = Math.max(0, bStart), ce = Math.min(totalLen, bEnd);
+    if (bEnd >= 0 && bStart <= effectiveLen) {
+      const cs = Math.max(0, bStart), ce = Math.min(effectiveLen, bEnd);
       const steps = Math.max(2, Math.ceil((ce - cs) / 5));
       const ppPts = [];
       for (let si = 0; si <= steps; si++) {
@@ -2415,7 +2427,7 @@ function project3D(p3, rotAngle) {
 
 // Draw dot-bar units along a native 3D sphere path (pts3D = [{x,y,z}] unit vectors).
 // Arc lengths are scaled by SR to screen-pixel equivalents for speed parity with flat mode.
-function drawUnitsOnSphere3D(ctx, pts3D, off, color, rotAngle) {
+function drawUnitsOnSphere3D(ctx, pts3D, off, color, rotAngle, drawProgress) {
   if (pts3D.length < 2) return;
   const SR = Math.min(W, H) * 0.44;
   const dists = [0];
@@ -2424,7 +2436,8 @@ function drawUnitsOnSphere3D(ctx, pts3D, off, color, rotAngle) {
     dists.push(dists[i-1] + Math.sqrt(dx*dx + dy*dy + dz*dz) * SR);
   }
   const totalLen = dists[dists.length-1];
-  if (totalLen < 1) return;
+  const effectiveLen = (drawProgress != null && drawProgress < 1) ? totalLen * drawProgress : totalLen;
+  if (effectiveLen < 1) return;
 
   function pt3DAtD(d) {
     d = Math.max(0, Math.min(totalLen, d));
@@ -2437,15 +2450,15 @@ function drawUnitsOnSphere3D(ctx, pts3D, off, color, rotAngle) {
   }
 
   ctx.fillStyle = color;
-  for (let d = -(off % UNIT); d < totalLen; d += UNIT) {
+  for (let d = -(off % UNIT); d < effectiveLen; d += UNIT) {
     const cD = d + CR;
-    if (cD >= 0 && cD <= totalLen) {
+    if (cD >= 0 && cD <= effectiveLen) {
       const pp = project3D(pt3DAtD(cD), rotAngle);
       if (pp) { ctx.beginPath(); ctx.arc(pp.x, pp.y, CR, 0, Math.PI * 2); ctx.fill(); }
     }
     const bStart = d + CR * 2 + GAP, bEnd = bStart + BW;
-    if (bEnd >= 0 && bStart <= totalLen) {
-      const cs = Math.max(0, bStart), ce = Math.min(totalLen, bEnd);
+    if (bEnd >= 0 && bStart <= effectiveLen) {
+      const cs = Math.max(0, bStart), ce = Math.min(effectiveLen, bEnd);
       const steps = Math.max(2, Math.ceil((ce - cs) / 5));
       const ppPts = [];
       for (let si = 0; si <= steps; si++) {
@@ -2555,9 +2568,14 @@ function draw(ts = performance.now()) {
   // Delta-time advancement: spatialX advances at fixed rad/s regardless of display Hz.
   // Spatial 1 & 2: 2π/10s (one drift cycle = 10s). Spatial 3: 2π/30s (one globe rotation = 30s).
   const dt = Math.min((ts - lastDrawTime) / 1000, 0.1);  // seconds, capped to avoid jumps
+  // Rolling display-FPS measurement (used by video export to match live speed)
+  if (lastDrawTime > 0 && dt > 0.005 && dt < 0.1) {
+    _dfpsAcc += 1 / dt; _dfpsN++;
+    if (_dfpsN >= 60) { _displayFPS = _dfpsAcc / _dfpsN; _dfpsAcc = 0; _dfpsN = 0; }
+  }
   lastDrawTime = ts;
   if (isSpatial) {
-    const radPerSec = S.movement === 'spatial3' ? (2 * Math.PI / 30) : (2 * Math.PI / 10);
+    const radPerSec = (S.movement === 'spatial3') ? (2 * Math.PI / 30) : (2 * Math.PI / 10);
     S.spatialX += radPerSec * dt;
   }
   const drift  = S.movement === 'spatial'  ? Math.sin(S.spatialX) * 120
@@ -2772,6 +2790,8 @@ function draw(ts = performance.now()) {
 
 let animId;
 let lastDrawTime = 0;
+let _displayFPS = 60;  // rolling average of screen refresh rate, used by video export
+let _dfpsAcc = 0, _dfpsN = 0;
 (function loop(ts) { lastDrawTime = lastDrawTime || ts; draw(ts); animId = requestAnimationFrame(loop); })(performance.now());
 
 // ================================================================
@@ -2938,7 +2958,9 @@ movementIds.forEach(id => {
     S.movement = movementVals[id];
     S.spatialX = 0; S.driftY = 0;
     // Rebuild whenever entering or leaving spatial3 — geometry is fundamentally different
-    if (S.movement === 'spatial3' || prevMovement === 'spatial3') {
+    const is3D = S.movement === 'spatial3';
+    const was3D = prevMovement === 'spatial3';
+    if (is3D || was3D) {
       S.networkNodes = null; S.networkNodes3D = null;
       rebuild();
     }
@@ -3078,7 +3100,7 @@ function drawExportPerimeters(ctx) {
 // Draw all paths into ctx (already in scaled + drift-translated space).
 // City blocks are re-clipped against shapes with road spacing. No canvas clip used here —
 // the caller must punch the void with clearRect/fillRect after this returns.
-function drawExportPaths(ctx, drift) {
+function drawExportPaths(ctx, drift, drawProgress) {
   for (const p of paths) {
     if (p.screenFixed) continue;
     // City blocks: re-clip against shapes each frame (mirrors live draw logic)
@@ -3111,27 +3133,43 @@ function drawExportPaths(ctx, drift) {
           for (let j=0; j<steps; j++) { const t=j/steps; pts.push({x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t}); }
         }
         pts.push(pts[0]);
-        drawUnits(ctx, flattenPath(pts), p.off, S.lineColor);
+        drawUnits(ctx, flattenPath(pts), p.off, S.lineColor, drawProgress);
       }
     } else {
       const subs = deformPath(p, drift);
-      for (const flat_r of subs) drawUnits(ctx, flat_r, p.off, S.lineColor);
+      for (const flat_r of subs) drawUnits(ctx, flat_r, p.off, S.lineColor, drawProgress);
     }
   }
 }
 
 // Draw sphere projection into ctx (ctx must already be scaled to export dimensions).
 // rotAngle drives the globe spin. The caller fills the background before calling this.
-function drawExportSphere(ctx, rotAngle) {
+function drawExportSphere(ctx, rotAngle, drawProgress) {
   const SR = Math.min(W, H) * 0.44;
   ctx.save();
   ctx.beginPath();
   ctx.arc(W * 0.5, H * 0.5, SR, 0, Math.PI * 2);
   ctx.clip();
-  for (const p of paths) {
-    if (!p.pts3D || p.pts3D.length < 2) continue;
-    drawUnitsOnSphere3D(ctx, p.pts3D, p.off, S.lineColor, rotAngle);
+
+  // For intro/outro, stagger each path so they cascade in/out rather than all drawing
+  // simultaneously. Without staggering the effect is invisible on the sphere because
+  // individual sphere paths are short — each reveals only a few dash units per step.
+  // With STAGGER=0.5, path 0 leads the draw-in; the last path lags by half the range.
+  // The per-path remapping preserves the easing already applied to the global drawProgress.
+  const validPaths = paths.filter(p => p.pts3D && p.pts3D.length >= 2);
+  const N = validPaths.length;
+  const STAGGER = 0.5;
+
+  for (let i = 0; i < N; i++) {
+    const p = validPaths[i];
+    let pathDP = drawProgress;
+    if (drawProgress > 0 && drawProgress < 1 && N > 1) {
+      const startAt = (i / (N - 1)) * STAGGER;
+      pathDP = Math.max(0, Math.min(1, (drawProgress - startAt) / (1 - STAGGER)));
+    }
+    drawUnitsOnSphere3D(ctx, p.pts3D, p.off, S.lineColor, rotAngle, pathDP);
   }
+
   if (S.pattern === 'networks' && S.networkNodes3D) {
     ctx.fillStyle = S.lineColor;
     for (const nd of S.networkNodes3D) {
@@ -3257,27 +3295,68 @@ document.getElementById('exSvg').addEventListener('click', () => {
   toast('Exported SVG');
 });
 
-document.getElementById('exVideo').addEventListener('click', () => {
+// ================================================================
+// SHARED VIDEO RECORDING — supports loop, intro, outro modes
+// ================================================================
+function recordVideo(mode) {
   if (S.recording) return;
 
-  const btn = document.getElementById('exVideo');
+  const FPS = 30;
+  const sm = 0.5 + S.speed * 3;
+  // fpsFactor compensates for the display refresh rate vs 30fps export.
+  // Live preview advances p.off at displayFPS per second; export runs at 30fps.
+  // We scale the target advance per export-frame accordingly so the visual speed matches.
+  const fpsFactor = Math.max(1, _displayFPS / FPS);
+  // FRAMES_BASE: chosen so that 1 UNIT of advance at minimum p.sp exactly fits in one loop.
+  // Formula: UNIT / (SP_MIN * sm * 0.4 * fpsFactor). Clamped to [60, 900].
+  // This automatically shortens the loop at high speed and lengthens it at low speed,
+  // always keeping quantization error small so adjustedStep ≈ natural screen speed.
+  const SP_MIN = 0.15;  // minimum p.sp used by all pattern builders
+  const FRAMES_BASE = S.movement === 'spatial3' ? 900
+    : Math.max(60, Math.min(900, Math.round(UNIT / (SP_MIN * sm * 0.4 * fpsFactor))));
+  const INTRO_FRAMES = 45;  // 1.5s at 30fps
+  const SPATIAL_STEP = (2 * Math.PI) / FRAMES_BASE;
+  // canonicalOff is captured right after rebuild so every clip (intro, loop, outro)
+  // shares the same frame-0 reference — the only way clips tile seamlessly when
+  // exported at different times.
+  const liveOff  = paths.map(p => p.off);           // restore live preview after recording
+  const savedOff = canonicalOff ? [...canonicalOff] : liveOff;
+
+  // easeOut for intro (lines rush in), easeIn for outro (lines fade out slowly)
+  const easeOut  = (t) => 1 - Math.pow(1 - t, 3);
+  const easeIn   = (t) => t * t * t;
+
+  let TOTAL_FRAMES, OUTRO_START, exportFileName, toastMsg;
+  if (mode === 'loop') {
+    TOTAL_FRAMES = FRAMES_BASE;
+    exportFileName = 'pattern-loop.mp4';
+    toastMsg = `Exported pattern-loop.mp4 (${Math.round(FRAMES_BASE / FPS)}s)`;
+  } else if (mode === 'intro') {
+    TOTAL_FRAMES = INTRO_FRAMES + FRAMES_BASE;
+    exportFileName = 'pattern-intro.mp4';
+    toastMsg = `Exported pattern-intro.mp4 (${Math.round(TOTAL_FRAMES / FPS)}s)`;
+  } else {
+    TOTAL_FRAMES = FRAMES_BASE + INTRO_FRAMES;
+    OUTRO_START = FRAMES_BASE;
+    exportFileName = 'pattern-outro.mp4';
+    toastMsg = `Exported pattern-outro.mp4 (${Math.round(TOTAL_FRAMES / FPS)}s)`;
+  }
+
+  // Quantize dash speeds: target advance per export-frame = p.sp * sm * 0.4 * fpsFactor
+  // (fpsFactor scales from display-fps to 30fps so the visual speed matches the live preview).
+  // Round to nearest integer nLoops of UNIT so the loop ends exactly where it started.
+  // Math.max(1,...) ensures no path is ever frozen.
+  const adjustedSteps = paths.map(p => {
+    const rawTotal = p.sp * sm * 0.4 * fpsFactor * FRAMES_BASE;
+    const nLoops = Math.max(1, Math.round(rawTotal / UNIT));
+    return (nLoops * UNIT) / FRAMES_BASE;
+  });
+
+  const btn = document.getElementById(
+    mode === 'loop' ? 'exVideo' : mode === 'intro' ? 'exIntro' : 'exOutro'
+  );
   const prog = document.getElementById('vp'), bar = document.getElementById('vpb');
 
-  // ── MP4 / H.264 export via MediaRecorder (no external deps) ─────────────────
-  // Renders one full seamless loop frame-by-frame to an off-screen canvas,
-  // captured as H.264 MP4 via MediaRecorder (native in Chrome/Safari on macOS).
-
-  const FPS = 30;
-  // FRAMES is computed per mode so the export speed matches the live animation.
-  // spatial + spatial2: liveInc = π/300 → FRAMES = 300 = 10s at 30fps (both same speed)
-  // spatial/spatial2: 300 frames = 10s | spatial3 (sphere): 900 frames = 30s | other: 150 frames = 5s
-  const FRAMES = S.movement === 'spatial3' ? 900
-               : (S.movement === 'spatial' || S.movement === 'spatial2') ? 300 : 150;
-  const SPATIAL_STEP = (2 * Math.PI) / FRAMES;
-  const sm = 0.5 + S.speed * 3;
-  const savedOff = paths.map(p => p.off);
-
-  // Pick best supported H.264 MP4 mime type
   const mp4Types = [
     'video/mp4; codecs="avc1.42E01E"',
     'video/mp4; codecs="avc1"',
@@ -3296,9 +3375,9 @@ document.getElementById('exVideo').addEventListener('click', () => {
   cancelAnimationFrame(animId);
 
   function cleanup() {
-    paths.forEach((p, i) => { p.off = savedOff[i]; });
+    paths.forEach((p, i) => { p.off = liveOff[i]; });  // resume live preview from where it was
     S.recording = false; btn.classList.remove('is-recording');
-    btn.textContent = 'Animation';
+    btn.textContent = mode === 'loop' ? 'Animation' : mode === 'intro' ? 'Intro' : 'Outro';
     prog.style.display = 'none'; bar.style.width = '0%';
     (function loop() { draw(); animId = requestAnimationFrame(loop); })();
   }
@@ -3307,31 +3386,35 @@ document.getElementById('exVideo').addEventListener('click', () => {
   const oc = document.createElement('canvas'); oc.width = EW; oc.height = EH;
   const octx = oc.getContext('2d');
 
-  function drawVideoFrame(drift, driftY = 0, s4rot = 0) {
+  // animFrame is always in [0, FRAMES_BASE-1], ensuring seamless loop alignment.
+  // drawVideoFrame uses animFrame (not raw f) so drift and sphere rotation also loop cleanly.
+  function drawVideoFrame(animFrame, drawProgress) {
     const sx = EW / W, sy = EH / H;
 
     octx.fillStyle = S.canvasBg;
     octx.fillRect(0, 0, EW, EH);
 
     if (S.movement === 'spatial3') {
-      // Sphere export: one full rotation per loop (perfect 5s cycle)
+      const s4rot = (animFrame / FRAMES_BASE) * 2 * Math.PI;
       octx.save(); octx.scale(sx, sy);
-      drawExportSphere(octx, s4rot);
+      drawExportSphere(octx, s4rot, drawProgress);
       octx.restore();
       return;
     }
 
-    // Phase 1: Fill background + draw pattern paths
+    const drift  = S.movement === 'spatial'  ? Math.sin(animFrame * SPATIAL_STEP) * 120
+                 : S.movement === 'spatial2' ? Math.sin(animFrame * SPATIAL_STEP) * 85 : 0;
+    const driftY = S.movement === 'spatial2' ? Math.sin(animFrame * SPATIAL_STEP * 2) * 50 : 0;
+
     octx.save();
     octx.scale(sx, sy);
     octx.save();
     octx.translate(drift, driftY);
     S.driftY = driftY;
-    drawExportPaths(octx, drift);
-    octx.restore();   // remove drift
-    octx.restore();   // remove scale
+    drawExportPaths(octx, drift, drawProgress);
+    octx.restore();
+    octx.restore();
 
-    // Phase 2: Punch void with background color
     if (S.shapes.length > 0 && (S.pattern === 'city' || S.pattern === 'networks')) {
       octx.fillStyle = S.canvasBg;
       for (const sh of S.shapes) {
@@ -3339,7 +3422,6 @@ document.getElementById('exVideo').addEventListener('click', () => {
       }
     }
 
-    // Phase 3: Draw perimeters + connections ON TOP of void (screen-fixed, scaled)
     octx.save();
     octx.scale(sx, sy);
     drawExportPerimeters(octx);
@@ -3355,14 +3437,13 @@ document.getElementById('exVideo').addEventListener('click', () => {
   recorder.onstop = () => {
     const blob = new Blob(chunks, { type: 'video/mp4' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.download = 'pattern-loop.mp4'; a.href = url; a.click();
+    const a = document.createElement('a'); a.download = exportFileName; a.href = url; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
-    const dur = Math.round(FRAMES / FPS);
-    toast(`Exported pattern-loop.mp4 (1920×1080 H.264, ${dur}s)`);
+    toast(toastMsg + ' (1920×1080 H.264)');
     cleanup();
   };
 
-  recorder.start(100);  // collect data in 100ms chunks
+  recorder.start(100);
 
   let f = 0;
   const MS_PER_FRAME = 1000 / FPS;
@@ -3371,17 +3452,49 @@ document.getElementById('exVideo').addEventListener('click', () => {
   function renderNext(now) {
     if (lastFrameTime === null) lastFrameTime = now;
     if (now - lastFrameTime >= MS_PER_FRAME - 1) {
-      lastFrameTime += MS_PER_FRAME;  // advance by fixed step to avoid drift
-      paths.forEach((p, i) => { p.off = savedOff[i] + f * p.sp * sm * 0.4; });
-      const drift  = S.movement === 'spatial'  ? Math.sin(f * SPATIAL_STEP) * 120
-                   : S.movement === 'spatial2' ? Math.sin(f * SPATIAL_STEP) * 85 : 0;
-      const driftY = S.movement === 'spatial2' ? Math.sin(f * SPATIAL_STEP * 2) * 50 : 0;
-      // Spatial3: one full globe rotation per loop (SPATIAL_STEP = 2π/300, matches 10s live cycle)
-      const s4rot  = S.movement === 'spatial3' ? f * SPATIAL_STEP : 0;
-      drawVideoFrame(drift, driftY, s4rot);
-      bar.style.width = ((f + 1) / FRAMES * 100) + '%';
+      lastFrameTime += MS_PER_FRAME;
+
+      // Map global frame f to a loop-position animFrame in [0, FRAMES_BASE-1].
+      //
+      // LOOP:  animFrame = f   (0..FRAMES_BASE-1, straightforward)
+      //
+      // INTRO: draw-in phase runs over loop states [FB-INTRO_FRAMES .. FB-1],
+      //        then the full loop follows at states [0 .. FB-1].
+      //        This means the last intro frame (animFrame=FB-1) transitions
+      //        to loop frame 0 via the normal seamless loop wrap — no jump.
+      //        Formula: ((f - INTRO_FRAMES) % FB + FB) % FB
+      //          f=0:            ((−45)%150+150)%150 = 105  (mid-loop, lines already moving)
+      //          f=INTRO_FRAMES: ((0)%150+150)%150   = 0    (matches loop frame 0)
+      //          f=last:         ((149)%150+150)%150 = 149  (matches loop frame 149)
+      //
+      // OUTRO: animFrame = f % FRAMES_BASE
+      //        f=0..FB-1 → 0..FB-1 (identical to loop, seamless after loop clip)
+      //        f=FB..FB+INTRO_FRAMES-1 wraps: 0..INTRO_FRAMES-1 (lines keep moving)
+      let animFrame;
+      if (mode === 'intro') {
+        animFrame = ((f - INTRO_FRAMES) % FRAMES_BASE + FRAMES_BASE) % FRAMES_BASE;
+      } else {
+        // loop and outro both work with simple modulo
+        animFrame = f % FRAMES_BASE;
+      }
+
+      // Draw progress: 1 normally, eases 0→1 during intro draw-in, 1→0 during outro draw-out
+      let drawProgress = 1;
+      if (mode === 'intro' && f < INTRO_FRAMES) {
+        drawProgress = easeOut(f / INTRO_FRAMES);
+      } else if (mode === 'outro' && f >= OUTRO_START) {
+        drawProgress = 1 - easeIn((f - OUTRO_START) / INTRO_FRAMES);
+      }
+
+      // Advance dash offsets using the loop-mapped animFrame so they always move
+      paths.forEach((p, i) => {
+        p.off = savedOff[i] + animFrame * adjustedSteps[i];
+      });
+
+      drawVideoFrame(animFrame, drawProgress);
+      bar.style.width = ((f + 1) / TOTAL_FRAMES * 100) + '%';
       f++;
-      if (f >= FRAMES) {
+      if (f >= TOTAL_FRAMES) {
         setTimeout(() => recorder.stop(), 300);
         return;
       }
@@ -3390,7 +3503,11 @@ document.getElementById('exVideo').addEventListener('click', () => {
   }
 
   requestAnimationFrame(renderNext);
-});
+}
+
+document.getElementById('exVideo').addEventListener('click', () => recordVideo('loop'));
+document.getElementById('exIntro').addEventListener('click', () => recordVideo('intro'));
+document.getElementById('exOutro').addEventListener('click', () => recordVideo('outro'));
 
 // ================================================================
 // INIT — apply default theme and pattern on load
