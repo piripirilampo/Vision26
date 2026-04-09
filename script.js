@@ -1143,11 +1143,22 @@ function buildPathways(r, n) {
   // ── Build trunks from selected layout ─────────────────────────────────────
   const layout = LAYOUTS[Math.min(S.seed, 10)];
 
+  S.pathwaysTrunks = [];
+  // Outer margin = same gap as between lines (lineSpacing - 2*CR).
+  // Formula: outermost line center ± (halfBundleWidth + lineSpacing - CR)
+  //        = (linesPerBundle+1)/2 * lineSpacing - CR  per side.
+  const maskWidth = (linesPerBundle + 1) * lineSpacing - CR * 2;
+
   for (let ti = 0; ti < layout.length; ti++) {
     const L  = layout[ti];
     const bx = halfW + L.c * step + (rng() - 0.5) * step * 0.06;
     const by = halfH + L.r * step + (rng() - 0.5) * step * 0.06;
     const trunk = T[L.t](bx, by);
+
+    // Store trunk center line (lineOffset=0) for bundle-level masking.
+    // Also store the raw 3-point waypoints for clean SVG mask geometry.
+    const trunkCenter = traceOffsetLine(trunk, 0);
+    S.pathwaysTrunks[ti] = { flat: flattenPath(trunkCenter), waypoints: trunk, maskWidth };
 
     for (let li = 0; li < linesPerBundle; li++) {
       const lineOffset = (li - (linesPerBundle - 1) / 2) * lineSpacing;
@@ -1156,7 +1167,7 @@ function buildPathways(r, n) {
         // bundleVal: center line → 0 (blue), outermost lines → 1 (light)
         const centerIdx = (linesPerBundle - 1) / 2;
         const bundleVal = linesPerBundle > 1 ? Math.abs(li - centerIdx) / centerIdx : 0;
-        paths.push({ pts, off: rng() * UNIT * 2, sp: 0.15 + rng() * 0.15, bundleVal });
+        paths.push({ pts, off: rng() * UNIT * 2, sp: 0.15 + rng() * 0.15, bundleVal, bundleId: ti });
       }
     }
   }
@@ -1164,7 +1175,7 @@ function buildPathways(r, n) {
 
 function rebuild() {
   const r = mkRand(S.seed * 7919 + 13);
-  paths = []; S.networkNodes = null; S.networkNodes3D = null;
+  paths = []; S.networkNodes = null; S.networkNodes3D = null; S.pathwaysTrunks = null; S.pathwaysTrunks3D = null;
   const d = S.density;
   if (S.movement === 'spatial3') {
     // Terrain sphere: current 0% visual → 40% slider. Remap [0.4,1]→[0,1], below 0.4 = minimum.
@@ -1388,25 +1399,32 @@ function buildNetworks(r, n) {
 
   for (const [p0, p1] of delaunayEdges) {
     const dx = p1.x - p0.x, dy = p1.y - p0.y;
-    const steps = Math.ceil(Math.hypot(dx, dy) / 6);
+    const len = Math.hypot(dx, dy);
+    const trim = CR * 3 + GAP; // 21px — ensures animated circles clear node dots by one full GAP
+    if (len < trim * 2 + 2) continue; // too short to draw between two node dots
+    // Shorten both ends so animated units sit clear of the node dot circles
+    const ux = dx / len, uy = dy / len;
+    const sx = p0.x + ux * trim, sy = p0.y + uy * trim;
+    const ex = p1.x - ux * trim, ey = p1.y - uy * trim;
+    const steps = Math.ceil((len - trim * 2) / 6);
     const pts = [];
     for (let i = 0; i <= steps; i++) {
       const t = i / steps;
-      pts.push({ x: p0.x + dx * t, y: p0.y + dy * t });
+      pts.push({ x: sx + (ex - sx) * t, y: sy + (ey - sy) * t });
     }
     paths.push({ pts, off: offRng() * UNIT * 2, sp: 0.15 + offRng() * 0.15, rigid: true,
                   networkColorVal: offRng() });  // random radial value per edge
   }
 
-  // Only store canvas-visible nodes for dot rendering
-  S.networkNodes = nodes.filter(nd => nd.x >= 0 && nd.x <= W && nd.y >= 0 && nd.y <= H);
+  // Store all nodes so every edge endpoint always has a dot, including bleed-area nodes that drift into view
+  S.networkNodes = nodes;
 }
 
 // ================================================================
 // RENDERING & INTERACTION (Shared across all patterns)
 // ================================================================
 // Line-unit dimensions — matching Lines.svg style (filled circle + filled bar)
-const CR=5, BW=33, BH=Math.round(CR*2*.865), GAP=4, UNIT_GAP=8, UNIT=CR*2+GAP+BW+UNIT_GAP;
+const CR=5, BW=33, BH=Math.round(CR*2*.865), GAP=6, UNIT_GAP=6, UNIT=CR*2+GAP+BW+UNIT_GAP;
 
 /**
  * Sutherland-Hodgman half-plane clip (top-level for reuse in draw loop).
@@ -1852,6 +1870,190 @@ function pointAtDistance(flat, dists, totalLen, d) {
            angle: Math.atan2(flat[hi].y - flat[lo].y, flat[hi].x - flat[lo].x) };
 }
 
+// Trim a flat point array to the first `frac` fraction of its total arc length.
+// Returns original array if frac >= 1 or undefined.
+function trimPtsToFrac(pts, frac) {
+  if (frac == null || frac >= 1 || pts.length < 2) return pts;
+  if (frac <= 0) return [];
+  const dists = [0];
+  for (let i = 1; i < pts.length; i++)
+    dists.push(dists[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+  const target = dists[dists.length - 1] * frac;
+  const out = [pts[0]];
+  for (let i = 1; i < pts.length; i++) {
+    if (dists[i] >= target) {
+      const segLen = dists[i] - dists[i - 1];
+      const t = segLen > 0 ? (target - dists[i - 1]) / segLen : 0;
+      out.push({ x: pts[i - 1].x + (pts[i].x - pts[i - 1].x) * t,
+                 y: pts[i - 1].y + (pts[i].y - pts[i - 1].y) * t });
+      break;
+    }
+    out.push(pts[i]);
+  }
+  return out;
+}
+
+// Bundle-level mask: draw a background-colored stroke along the trunk centerline,
+// wide enough to cover the entire bundle. Called ONCE per bundle before all its paths
+// so later-drawn bundles visually occlude earlier ones (over/under layering).
+// drawProgress (optional): if < 1, only mask the first fraction of the path (for intro/outro).
+function drawBundleMask(ctx, pts, maskWidth, drawProgress) {
+  const usePts = trimPtsToFrac(pts, drawProgress);
+  if (!usePts || usePts.length < 2) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(usePts[0].x, usePts[0].y);
+  for (let i = 1; i < usePts.length; i++) ctx.lineTo(usePts[i].x, usePts[i].y);
+  ctx.strokeStyle = S.canvasBg;
+  ctx.lineWidth = maskWidth;
+  ctx.lineCap = 'butt';
+  ctx.lineJoin = 'miter';
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Same for sphere paths — projects pts3D, breaks stroke at back-face null projections.
+// drawProgress trims by point-count fraction (approximate but smooth for transitions).
+function drawBundleMaskSphere(ctx, pts3D, maskWidth, rotAngle, drawProgress) {
+  if (!pts3D || pts3D.length < 2) return;
+  const endIdx = (drawProgress != null && drawProgress < 1)
+    ? Math.max(2, Math.ceil(pts3D.length * drawProgress)) : pts3D.length;
+  ctx.save();
+  ctx.strokeStyle = S.canvasBg;
+  ctx.lineWidth = maskWidth;
+  ctx.lineCap = 'butt';
+  ctx.lineJoin = 'miter';
+  ctx.beginPath();
+  let started = false;
+  for (let i = 0; i < endIdx; i++) {
+    const pp = project3D(pts3D[i], rotAngle);
+    if (!pp) { started = false; continue; }
+    if (!started) { ctx.moveTo(pp.x, pp.y); started = true; }
+    else ctx.lineTo(pp.x, pp.y);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Polygon mask for sphere bundles: fills the exact projected footprint of the bundle
+// between its two outer edge lines (outerA / outerB stored in S.pathwaysTrunks3D[i]).
+// This replaces the fixed-pixel-width stroke approach which created huge gaps at poles.
+// punch=true uses destination-out for export (transparent hole), otherwise fills canvasBg.
+function drawBundleMaskSpherePolygon(ctx, outerA, outerB, rotAngle, drawProgress, punch) {
+  if (!outerA || !outerB || outerA.length < 2) return;
+  const len = Math.min(outerA.length, outerB.length);
+  const endIdx = (drawProgress != null && drawProgress < 1)
+    ? Math.max(2, Math.ceil(len * drawProgress)) : len;
+
+  ctx.save();
+  if (punch) {
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.fillStyle = 'rgba(0,0,0,1)';
+  } else {
+    ctx.fillStyle = S.canvasBg;
+  }
+
+  // Projection for outer edges.  Front-hemisphere points project normally.
+  // Points near or behind the limb (xr ≤ 0.02) are projected onto the limb circle
+  // (normalize (yr,zr) to radius 1) so the polygon cap lands exactly on the disc
+  // edge instead of inside the sphere at an arbitrary back-face position.
+  // This eliminates the rectangular artifacts that appeared near the poles when
+  // the back-hemisphere projection overshot the intended bundle footprint.
+  // Points well behind the sphere (xr ≤ -0.3) return null — polygon flushes there.
+  const cos_r = Math.cos(rotAngle), sin_r = Math.sin(rotAngle);
+  const SR_m = Math.min(W, H) * 0.44;
+  function projectEdge(p3) {
+    const xr = p3.x * cos_r - p3.y * sin_r;
+    const yr = p3.x * sin_r + p3.y * cos_r;
+    const zr = p3.z;
+    if (xr > 0.02) return { x: W * 0.5 + yr * SR_m, y: H * 0.5 - zr * SR_m };
+    if (xr <= -0.3) return null;
+    // Near-limb: project to disc edge so polygon caps cleanly at sphere boundary
+    const mag = Math.sqrt(yr * yr + zr * zr);
+    if (mag < 1e-6) return null;
+    return { x: W * 0.5 + (yr / mag) * SR_m, y: H * 0.5 - (zr / mag) * SR_m };
+  }
+
+  let segA = [], segB = [];
+
+  function flushSeg() {
+    if (segA.length < 2) { segA = []; segB = []; return; }
+    ctx.beginPath();
+    ctx.moveTo(segA[0].x, segA[0].y);
+    for (let k = 1; k < segA.length; k++) ctx.lineTo(segA[k].x, segA[k].y);
+    for (let k = segB.length - 1; k >= 0; k--) ctx.lineTo(segB[k].x, segB[k].y);
+    ctx.closePath();
+    ctx.fill();
+    segA = []; segB = [];
+  }
+
+  for (let i = 0; i < endIdx; i++) {
+    const pA = projectEdge(outerA[i]);
+    const pB = projectEdge(outerB[i]);
+    if (pA && pB) { segA.push(pA); segB.push(pB); }
+    else flushSeg();
+  }
+  flushSeg();
+  ctx.restore();
+}
+
+// Export version: punch a transparent hole using destination-out.
+// For PNG: transparent holes at crossings. For JPG: bg fill composited afterward.
+function drawExportBundleMask(ctx, pts, maskWidth, drawProgress) {
+  const usePts = trimPtsToFrac(pts, drawProgress);
+  if (!usePts || usePts.length < 2) return;
+  ctx.save();
+  ctx.globalCompositeOperation = 'destination-out';
+  ctx.beginPath();
+  ctx.moveTo(usePts[0].x, usePts[0].y);
+  for (let i = 1; i < usePts.length; i++) ctx.lineTo(usePts[i].x, usePts[i].y);
+  ctx.strokeStyle = 'rgba(0,0,0,1)';
+  ctx.lineWidth = maskWidth;
+  ctx.lineCap = 'butt';
+  ctx.lineJoin = 'miter';
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Export sphere version: destination-out punch for sphere projection.
+function drawExportBundleMaskSphere(ctx, pts3D, maskWidth, rotAngle, drawProgress) {
+  if (!pts3D || pts3D.length < 2) return;
+  const endIdx = (drawProgress != null && drawProgress < 1)
+    ? Math.max(2, Math.ceil(pts3D.length * drawProgress)) : pts3D.length;
+  ctx.save();
+  ctx.globalCompositeOperation = 'destination-out';
+  ctx.strokeStyle = 'rgba(0,0,0,1)';
+  ctx.lineWidth = maskWidth;
+  ctx.lineCap = 'butt';
+  ctx.lineJoin = 'miter';
+  ctx.beginPath();
+  let started = false;
+  for (let i = 0; i < endIdx; i++) {
+    const pp = project3D(pts3D[i], rotAngle);
+    if (!pp) { started = false; continue; }
+    if (!started) { ctx.moveTo(pp.x, pp.y); started = true; }
+    else ctx.lineTo(pp.x, pp.y);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Minimum distance from point (px,py) to a polyline (array of {x,y}).
+// Used by SVG export to test if a shape falls inside a later bundle's trunk corridor.
+function distToPolyline(px, py, pts) {
+  let minD = Infinity;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const ax = pts[i].x, ay = pts[i].y;
+    const bx = pts[i + 1].x, by = pts[i + 1].y;
+    const dx = bx - ax, dy = by - ay;
+    const lenSq = dx * dx + dy * dy;
+    if (lenSq < 0.001) { minD = Math.min(minD, Math.hypot(px - ax, py - ay)); continue; }
+    const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq));
+    minD = Math.min(minD, Math.hypot(px - (ax + t * dx), py - (ay + t * dy)));
+  }
+  return minD;
+}
+
 // Draw filled circle+bar units along a flattened path (matches Lines.svg style).
 // radialVal (0..1): if provided and colorMode==='radial', overrides color with a
 // solid per-line color lerped from S.radialColorA (0) to S.radialColorB (1).
@@ -2174,18 +2376,37 @@ function buildPathwaysSphere(r, n) {
   const trunks = LAYOUTS[seed];
 
   // ── Generate bundles for each trunk ───────────────────────────────────
+  S.pathwaysTrunks3D = [];
+  // Outer edge offset in radians: half-bundle width + circle radius + small gap buffer.
+  // These two outer lines define the exact footprint of the bundle when projected —
+  // used to draw a filled polygon mask that correctly follows the bundle shape at any
+  // sphere orientation, avoiding the fixed-pixel-width approximation errors.
+  const SR_build = Math.min(W, H) * 0.44;
+  // outerOffset = half of the new maskWidth in radians (outer margin = inter-line gap).
+  const outerOffset = (linesPerBundle + 1) / 2 * lineSpacing - CR / SR_build;
+
   for (let ti = 0; ti < trunks.length; ti++) {
     const trunkPath = trunks[ti];
+    const trunkCenter = traceOffsetLine(trunkPath, 0);
+    S.pathwaysTrunks3D[ti] = {
+      pts3D:    trunkCenter.map(toSphere),
+      outerA:   traceOffsetLine(trunkPath, -outerOffset).map(toSphere),
+      outerB:   traceOffsetLine(trunkPath,  outerOffset).map(toSphere),
+      // Screen-pixel mask width (equator) — matches flat mode formula.
+      maskWidth: (linesPerBundle + 1) * lineSpacing * SR_build - CR * 2,
+    };
+
     for (let li = 0; li < linesPerBundle; li++) {
       const lineOffset = (li - (linesPerBundle - 1) / 2) * lineSpacing;
       const pts = traceOffsetLine(trunkPath, lineOffset);
       if (pts.length > 2) {
         const centerIdx = (linesPerBundle - 1) / 2;
         const bundleVal = linesPerBundle > 1 ? Math.abs(li - centerIdx) / centerIdx : 0;
-        paths.push({ pts3D: pts.map(toSphere), off: rng() * UNIT * 4, sp: 0.15 + rng() * 0.15, bundleVal });
+        paths.push({ pts3D: pts.map(toSphere), off: rng() * UNIT * 4, sp: 0.15 + rng() * 0.15, bundleVal, bundleId: ti });
       }
     }
   }
+
 }
 
 // City: rectangular block grid on sphere with diagonal corridor clipping — mirrors flat mode
@@ -2384,17 +2605,24 @@ function buildNetworksSphere(r, n) {
       const p1 = nodes3D[j];
       const ARC_STEPS = Math.max(3, Math.ceil(angle * 18));
       const pts3D = [];
-      if (angle < 0.001) {
+      // Shorten arc at both ends by the angular equivalent of 3*CR+GAP on a unit sphere
+      // (matches flat trim = CR*3+GAP = 21px; ensures animated circles clear node dots by one full GAP)
+      const angTrim = Math.min((CR * 3 + GAP) / (Math.min(W, H) * 0.44), angle * 0.25);
+      const trimA = angTrim, trimB = angle - angTrim;
+      if (trimB <= trimA) {
+        // Arc too short — skip
+      } else if (angle < 0.001) {
         pts3D.push({ ...p0 }, { ...p1 });
       } else {
         const sinA = Math.sin(angle);
         for (let si = 0; si <= ARC_STEPS; si++) {
-          const tt = si / ARC_STEPS;
-          const f0 = Math.sin((1-tt)*angle)/sinA, f1 = Math.sin(tt*angle)/sinA;
+          const tt = trimA + (trimB - trimA) * (si / ARC_STEPS);
+          const f0 = Math.sin((1-tt/angle)*angle)/sinA, f1 = Math.sin((tt/angle)*angle)/sinA;
           pts3D.push({ x: f0*p0.x+f1*p1.x, y: f0*p0.y+f1*p1.y, z: f0*p0.z+f1*p1.z });
         }
       }
-      paths.push({ pts3D, off: offRng() * UNIT * 2, sp: 0.15 + offRng() * 0.15, rigid: true, networkColorVal: offRng() });
+      if (pts3D.length >= 2)
+        paths.push({ pts3D, off: offRng() * UNIT * 2, sp: 0.15 + offRng() * 0.15, rigid: true, networkColorVal: offRng() });
     }
   }
   S.networkNodes3D = nodes3D;
@@ -2672,8 +2900,14 @@ function draw(ts = performance.now()) {
     cx.arc(W * 0.5, H * 0.5, SR, 0, Math.PI * 2);
     cx.clip();
 
+    let lastBundleId3D = -1;
     for (const p of paths) {
       if (!p.pts3D || p.pts3D.length < 2) continue;
+      if (S.pattern === 'pathways' && S.pathwaysTrunks3D && p.bundleId !== lastBundleId3D) {
+        const trunk = S.pathwaysTrunks3D[p.bundleId];
+        if (trunk) drawBundleMaskSpherePolygon(cx, trunk.outerA, trunk.outerB, s4rot);
+        lastBundleId3D = p.bundleId;
+      }
       drawUnitsOnSphere3D(cx, p.pts3D, p.off, S.lineColor, s4rot, undefined, pathRadialVal(p));
     }
 
@@ -2706,6 +2940,7 @@ function draw(ts = performance.now()) {
       cx.clip('evenodd');
     }
 
+    let lastBundleId = -1;
     for (const p of paths) {
       if (p.screenFixed) continue;
 
@@ -2750,6 +2985,13 @@ function draw(ts = performance.now()) {
         continue;
       }
 
+      // Bundle-level mask: draw once per bundle before all its lines (over/under layering)
+      if (S.pattern === 'pathways' && S.pathwaysTrunks && p.bundleId !== lastBundleId) {
+        const trunk = S.pathwaysTrunks[p.bundleId];
+        if (trunk) drawBundleMask(cx, trunk.flat, trunk.maskWidth);
+        lastBundleId = p.bundleId;
+      }
+
       // Use pre-computed flat when available (e.g. terrain), UNLESS terrain has shapes —
       // in that case deformPath must run to split paths at shape boundaries (uses p.pts).
       const needsDeform = S.pattern === 'terrain' && S.shapes.length > 0;
@@ -2757,7 +2999,9 @@ function draw(ts = performance.now()) {
         drawUnits(cx, p.flat, p.off, S.lineColor, undefined, pathRadialVal(p));
       } else {
         const subs = deformPath(p, drift);
-        for (const flat_r of subs) drawUnits(cx, flat_r, p.off, S.lineColor, undefined, pathRadialVal(p));
+        for (const flat_r of subs) {
+          drawUnits(cx, flat_r, p.off, S.lineColor, undefined, pathRadialVal(p));
+        }
       }
     }
 
@@ -3160,7 +3404,9 @@ function drawExportPerimeters(ctx) {
 // Draw all paths into ctx (already in scaled + drift-translated space).
 // City blocks are re-clipped against shapes with road spacing. No canvas clip used here —
 // the caller must punch the void with clearRect/fillRect after this returns.
-function drawExportPaths(ctx, drift, drawProgress) {
+// maskMode: false/undefined = no mask, 'bg' = bg-colored stroke, 'punch' = destination-out
+function drawExportPaths(ctx, drift, drawProgress, maskMode) {
+  let lastBundleId = -1;
   for (const p of paths) {
     if (p.screenFixed) continue;
     // City blocks: re-clip against shapes each frame (mirrors live draw logic)
@@ -3196,6 +3442,17 @@ function drawExportPaths(ctx, drift, drawProgress) {
         drawUnits(ctx, flattenPath(pts), p.off, S.lineColor, drawProgress, pathRadialVal(p));
       }
     } else {
+      // Bundle-level mask for Pathways over/under layering
+      if (maskMode && S.pattern === 'pathways' && S.pathwaysTrunks && p.bundleId !== lastBundleId) {
+        const trunk = S.pathwaysTrunks[p.bundleId];
+        if (trunk) {
+          if (maskMode === 'punch')
+            drawExportBundleMask(ctx, trunk.flat, trunk.maskWidth, drawProgress);
+          else
+            drawBundleMask(ctx, trunk.flat, trunk.maskWidth, drawProgress);
+        }
+        lastBundleId = p.bundleId;
+      }
       const subs = deformPath(p, drift);
       for (const flat_r of subs) drawUnits(ctx, flat_r, p.off, S.lineColor, drawProgress, pathRadialVal(p));
     }
@@ -3204,7 +3461,8 @@ function drawExportPaths(ctx, drift, drawProgress) {
 
 // Draw sphere projection into ctx (ctx must already be scaled to export dimensions).
 // rotAngle drives the globe spin. The caller fills the background before calling this.
-function drawExportSphere(ctx, rotAngle, drawProgress) {
+// maskMode: false/undefined = no mask, 'bg' = bg-colored stroke, 'punch' = destination-out
+function drawExportSphere(ctx, rotAngle, drawProgress, maskMode) {
   const SR = Math.min(W, H) * 0.44;
   ctx.save();
   ctx.beginPath();
@@ -3220,8 +3478,16 @@ function drawExportSphere(ctx, rotAngle, drawProgress) {
   const N = validPaths.length;
   const STAGGER = 0.5;
 
+  let lastBundleIdSph = -1;
   for (let i = 0; i < N; i++) {
     const p = validPaths[i];
+    if (maskMode && S.pattern === 'pathways' && S.pathwaysTrunks3D && p.bundleId !== lastBundleIdSph) {
+      const trunk = S.pathwaysTrunks3D[p.bundleId];
+      if (trunk) {
+        drawBundleMaskSpherePolygon(ctx, trunk.outerA, trunk.outerB, rotAngle, drawProgress, maskMode === 'punch');
+      }
+      lastBundleIdSph = p.bundleId;
+    }
     let pathDP = drawProgress;
     if (drawProgress > 0 && drawProgress < 1 && N > 1) {
       const startAt = (i / (N - 1)) * STAGGER;
@@ -3258,13 +3524,17 @@ function renderPatternToCanvas(ew, eh) {
   if (S.movement === 'spatial3') {
     // Sphere export: transparent background (PNG), bg added by JPG handler separately
     tx.save(); tx.scale(sx, sy);
-    drawExportSphere(tx, S.spatialX);
+    drawExportSphere(tx, S.spatialX, undefined, 'punch');
     tx.restore();
   } else {
     // Phase 1: Draw pattern paths (city blocks re-clipped, network lines, terrain splits)
     tx.save();
     tx.scale(sx, sy);
-    drawExportPaths(tx, 0);
+    drawExportPaths(tx, 0, undefined, 'punch');
+    if (S.pattern === 'networks' && S.networkNodes) {
+      tx.fillStyle = S.lineColor;
+      for (const n of S.networkNodes) { tx.beginPath(); tx.arc(n.x, n.y, CR, 0, Math.PI * 2); tx.fill(); }
+    }
     tx.restore();
 
     // Phase 2: Punch void — clearRect creates transparent hole (PNG) or lets JPG bg show through
@@ -3338,26 +3608,20 @@ document.getElementById('exSvg').addEventListener('click', () => {
   // (cv dimensions intentionally not changed to avoid clearing the live canvas)
   W = 1920; H = 1080;
   rebuild();
+  let _svgResult = null;
+  try {
 
-  let body = '';
-  // Build unit positions for each path and emit SVG circles + rects
-  for (const p of paths) {
-    const rv = pathRadialVal(p);
-    const col = (S.colorMode === 'radial' && rv != null)
-      ? lerpColor(S.radialColorA, S.radialColorB, rv)
-      : S.lineColor;
-    const subs = deformPath(p, 0);
-    for (const flat of subs) {
-    if (flat.length < 2) continue;
+  // Helper: emit SVG unit shapes (circles + bar polygons) for one flat path.
+  function svgUnitsForFlat(flat, off, col) {
+    let out = '';
+    if (flat.length < 2) return out;
     const dists = [0];
     for (let i=1;i<flat.length;i++) dists.push(dists[i-1]+Math.hypot(flat[i].x-flat[i-1].x,flat[i].y-flat[i-1].y));
     const totalLen = dists[dists.length-1];
     const atDFn = d => pointAtDistance(flat, dists, totalLen, d);
-    for (let d=-(p.off%UNIT);d<totalLen;d+=UNIT) {
-      // Circle unit
+    for (let d=-(off%UNIT);d<totalLen;d+=UNIT) {
       const cD=d+CR;
-      if(cD>=-CR&&cD<=totalLen+CR){const pt=atDFn(cD);body+=`<circle cx="${pt.x.toFixed(1)}" cy="${pt.y.toFixed(1)}" r="${CR}" fill="${col}"/>\n`;}
-      // Bar unit — polygon ribbon that bends along the path (matches canvas drawUnits exactly)
+      if(cD>=-CR&&cD<=totalLen+CR){const pt=atDFn(cD);out+=`<circle cx="${pt.x.toFixed(1)}" cy="${pt.y.toFixed(1)}" r="${CR}" fill="${col}"/>\n`;}
       const bStart=d+CR*2+GAP, bEnd=bStart+BW;
       if(bEnd>=0&&bStart<=totalLen){
         const cs=Math.max(0,bStart), ce=Math.min(totalLen,bEnd);
@@ -3369,26 +3633,180 @@ document.getElementById('exSvg').addEventListener('click', () => {
           top.push(`${(pt.x+nx*BH/2).toFixed(1)},${(pt.y+ny*BH/2).toFixed(1)}`);
           bot.push(`${(pt.x-nx*BH/2).toFixed(1)},${(pt.y-ny*BH/2).toFixed(1)}`);
         }
-        body+=`<polygon points="${[...top,...bot.reverse()].join(' ')}" fill="${col}"/>\n`;
+        out+=`<polygon points="${[...top,...bot.reverse()].join(' ')}" fill="${col}"/>\n`;
       }
     }
+    return out;
+  }
+
+  // Geometric helpers for Pathways over/under clipping.
+  // Instead of SVG masks, we compute the visible portions of each flat path by
+  // checking which points fall inside a later bundle's trunk corridor, then split
+  // the path into visible sub-segments and only emit shapes for those segments.
+  // This produces a clean SVG with no <mask>, <clipPath>, or hidden elements —
+  // only the circles and polygons that are actually visible.
+
+  function distPtToSeg(px, py, ax, ay, bx, by) {
+    const dx = bx - ax, dy = by - ay;
+    const lenSq = dx*dx + dy*dy;
+    if (lenSq === 0) return Math.hypot(px - ax, py - ay);
+    const t = Math.max(0, Math.min(1, ((px-ax)*dx + (py-ay)*dy) / lenSq));
+    return Math.hypot(px - (ax + t*dx), py - (ay + t*dy));
+  }
+
+  // Returns true if pt is inside any of the given trunk corridors (within maskWidth/2 of trunk).
+  function insideCorridor(pt, trunks) {
+    for (const trunk of trunks) {
+      const half = trunk.maskWidth / 2;
+      const tf = trunk.flat;
+      for (let k = 1; k < tf.length; k++) {
+        if (distPtToSeg(pt.x, pt.y, tf[k-1].x, tf[k-1].y, tf[k].x, tf[k].y) <= half) return true;
+      }
+    }
+    return false;
+  }
+
+  // Split a flat path into visible sub-segments (those outside all later corridors).
+  // Returns array of { sub: [pts], startDist: number } where startDist is the
+  // cumulative path distance to the start of this sub-segment (used to preserve
+  // the unit dash phase relative to the original full path).
+  function visibleSubPaths(flat, laterTrunks) {
+    if (laterTrunks.length === 0) return [{ sub: flat, startDist: 0 }];
+    const dists = [0];
+    for (let i = 1; i < flat.length; i++)
+      dists.push(dists[i-1] + Math.hypot(flat[i].x - flat[i-1].x, flat[i].y - flat[i-1].y));
+
+    const hidden = flat.map(pt => insideCorridor(pt, laterTrunks));
+    const result = [];
+    let current = null;
+    for (let i = 0; i < flat.length; i++) {
+      if (!hidden[i]) {
+        if (!current) current = { sub: [], startDist: dists[i] };
+        current.sub.push(flat[i]);
+      } else {
+        if (current && current.sub.length >= 2) result.push(current);
+        current = null;
+      }
+    }
+    if (current && current.sub.length >= 2) result.push(current);
+    return result;
+  }
+
+  const bundleIds = S.pathwaysTrunks ? Object.keys(S.pathwaysTrunks).map(Number).sort((a,b)=>a-b) : [];
+
+  // Group paths by bundleId (preserving draw order) — works for both flat and sphere paths.
+  const bundleGroups = new Map();
+  for (const p of paths) {
+    if (p.bundleId != null) {
+      if (!bundleGroups.has(p.bundleId)) bundleGroups.set(p.bundleId, []);
+      bundleGroups.get(p.bundleId).push(p);
     }
   }
+
+  // Helper for sphere mode: project a pts3D array to screen-space segments,
+  // splitting into sub-arrays at back-hemisphere null projections.
+  function projectFlat3D(pts3D) {
+    const rotAngle = S.spatialX;
+    const segments = [];
+    let current = [];
+    for (const p3 of pts3D) {
+      const pp = project3D(p3, rotAngle);
+      if (pp) { current.push(pp); }
+      else { if (current.length >= 2) segments.push(current); current = []; }
+    }
+    if (current.length >= 2) segments.push(current);
+    return segments;
+  }
+
+  let body = '';
+
+  if (S.pattern === 'pathways' && S.movement === 'spatial3' && S.pathwaysTrunks3D) {
+    // ── Sphere mode pathways ──────────────────────────────────────────────────
+    // Project native 3D paths to screen space, then apply the same geometric
+    // corridor clipping used in flat mode. No masks or hidden elements.
+    const sphereIds = Object.keys(S.pathwaysTrunks3D).map(Number).sort((a,b)=>a-b);
+    for (let i = 0; i < sphereIds.length; i++) {
+      const id = sphereIds[i];
+      // Project later trunk CENTERS to screen — same distance-corridor approach as flat mode.
+      // maskWidth stored on trunk data matches the flat formula (screen pixels at equator).
+      const laterTrunks = [];
+      for (let j = i + 1; j < sphereIds.length; j++) {
+        const lt = S.pathwaysTrunks3D[sphereIds[j]];
+        if (lt && lt.pts3D && lt.pts3D.length >= 2 && lt.maskWidth) {
+          for (const seg of projectFlat3D(lt.pts3D)) {
+            if (seg.length >= 2) laterTrunks.push({ flat: seg, maskWidth: lt.maskWidth });
+          }
+        }
+      }
+      for (const p of (bundleGroups.get(id) || [])) {
+        const rv = pathRadialVal(p);
+        const col = (S.colorMode === 'radial' && rv != null) ? lerpColor(S.radialColorA, S.radialColorB, rv) : S.lineColor;
+        for (const flat of projectFlat3D(p.pts3D)) {
+          const visSubs = visibleSubPaths(flat, laterTrunks);
+          for (const { sub, startDist } of visSubs) {
+            body += svgUnitsForFlat(sub, p.off + startDist, col);
+          }
+        }
+      }
+    }
+  } else if (S.pattern === 'pathways') {
+    // ── Flat mode pathways ────────────────────────────────────────────────────
+    for (let i = 0; i < bundleIds.length; i++) {
+      const id = bundleIds[i];
+      // Collect trunk corridors of all later bundles — these hide earlier bundles' lines.
+      const laterTrunks = [];
+      for (let j = i + 1; j < bundleIds.length; j++) {
+        const lt = S.pathwaysTrunks[bundleIds[j]];
+        if (lt && lt.flat && lt.flat.length >= 2) laterTrunks.push(lt);
+      }
+      for (const p of (bundleGroups.get(id) || [])) {
+        const rv = pathRadialVal(p);
+        const col = (S.colorMode === 'radial' && rv != null) ? lerpColor(S.radialColorA, S.radialColorB, rv) : S.lineColor;
+        const subs = deformPath(p, 0);
+        for (const flat of subs) {
+          const visSubs = visibleSubPaths(flat, laterTrunks);
+          for (const { sub, startDist } of visSubs) {
+            body += svgUnitsForFlat(sub, p.off + startDist, col);
+          }
+        }
+      }
+    }
+  } else {
+    // ── All other patterns: emit directly in draw order ───────────────────────
+    for (const p of paths) {
+      const rv = pathRadialVal(p);
+      const col = (S.colorMode === 'radial' && rv != null) ? lerpColor(S.radialColorA, S.radialColorB, rv) : S.lineColor;
+      if (p.pts3D) {
+        // Sphere path (terrain/city/networks in world mode) — project 3D to screen
+        for (const flat of projectFlat3D(p.pts3D)) body += svgUnitsForFlat(flat, p.off, col);
+      } else {
+        const subs = deformPath(p, 0);
+        for (const flat of subs) body += svgUnitsForFlat(flat, p.off, col);
+      }
+    }
+  }
+
   const nodeCol = S.colorMode === 'radial' ? lerpColor(S.radialColorA, S.radialColorB, 0) : S.lineColor;
   if(S.networkNodes){for(const n of S.networkNodes){const d=repulse(n.x,n.y,0);body+=`<circle cx="${(n.x+d.ox).toFixed(1)}" cy="${(n.y+d.oy).toFixed(1)}" r="${CR}" fill="${nodeCol}"/>\n`;}}
 
   const bgRect = `<rect width="${W}" height="${H}" fill="${S.canvasBg}"/>\n`;
-  const svg=`<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}">\n${bgRect}<g>\n${body}</g>\n</svg>`;
+    _svgResult=`<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}">\n${bgRect}<g>\n${body}</g>\n</svg>`;
+  } catch(e) {
+    console.error('SVG export error:', e);
+    toast('SVG export failed — see console');
+  } finally {
+    // Always restore live state so the app never gets stuck at export dimensions
+    W = savedW; H = savedH;
+    rebuild();
+    paths.forEach((p, i) => { if (i < liveOff.length) p.off = liveOff[i]; });
+    (function liveLoop() { draw(); animId = requestAnimationFrame(liveLoop); })();
+  }
 
-  // Restore live state — cv dimensions were never changed, so no canvas clear occurs
-  W = savedW; H = savedH;
-  rebuild();
-  paths.forEach((p, i) => { if (i < liveOff.length) p.off = liveOff[i]; });
-  (function liveLoop() { draw(); animId = requestAnimationFrame(liveLoop); })();
-
-  const a=document.createElement('a'); a.download='pattern.svg';
-  a.href=URL.createObjectURL(new Blob([svg],{type:'image/svg+xml'})); a.click();
-  toast('Exported SVG');
+  if (_svgResult) {
+    const a=document.createElement('a'); a.download='pattern.svg';
+    a.href=URL.createObjectURL(new Blob([_svgResult],{type:'image/svg+xml'})); a.click();
+    toast('Exported SVG');
+  }
 });
 
 // ================================================================
@@ -3504,7 +3922,7 @@ function recordVideo(mode) {
     if (S.movement === 'spatial3') {
       const s4rot = (animFrame / FRAMES_BASE) * 2 * Math.PI;
       octx.save(); octx.scale(sx, sy);
-      drawExportSphere(octx, s4rot, drawProgress);
+      drawExportSphere(octx, s4rot, drawProgress, 'bg');
       octx.restore();
       return;
     }
@@ -3518,7 +3936,11 @@ function recordVideo(mode) {
     octx.save();
     octx.translate(drift, driftY);
     S.driftY = driftY;
-    drawExportPaths(octx, drift, drawProgress);
+    drawExportPaths(octx, drift, drawProgress, 'bg');
+    if (S.pattern === 'networks' && S.networkNodes) {
+      octx.fillStyle = S.lineColor;
+      for (const n of S.networkNodes) { octx.beginPath(); octx.arc(n.x, n.y, CR, 0, Math.PI * 2); octx.fill(); }
+    }
     octx.restore();
     octx.restore();
 
